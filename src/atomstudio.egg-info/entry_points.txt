@@ -1,0 +1,2 @@
+[console_scripts]
+atomstudio = atomstudio.cli:main

@@ -1,0 +1,26 @@
+version: 2
+jobs:
+  - id: handdrawn_surface_v2
+    input:
+      path: ../../tests/data/water.xyz
+      frames: last
+    output:
+      path: ../../outputs/handdrawn_surface_v2.png
+    style:
+      scene_style: handdrawn
+      light_style: handdrawn_soft_spot
+      handdrawn:
+        light_direction: [0.74, 0.42, 0.52]
+        shadow_area: 0.52
+        shadow_strength: 0.38
+        shadow_softness: 0.11
+        highlight_strength: 0.55
+        highlight_direction: [0.62, 0.52, 0.52]
+        highlight_arc_length: 0.08
+        highlight_band_inner: 0.42
+        highlight_band_outer: 0.62
+    render:
+      engine: eevee
+      samples: 4
+      resolution: [320, 320]
+      transparent_bg: true

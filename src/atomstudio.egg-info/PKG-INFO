@@ -1,0 +1,16 @@
+Metadata-Version: 2.4
+Name: atomstudio
+Version: 0.1.0
+Summary: ASE to Blender rendering toolkit
+Author: atomstudio contributors
+License: MIT
+Requires-Python: >=3.11
+Requires-Dist: ase>=3.27.0
+Requires-Dist: numpy>=1.26
+Requires-Dist: PyYAML>=6.0
+Provides-Extra: gui
+Requires-Dist: PySide6>=6.7; extra == "gui"
+Requires-Dist: vispy>=0.14; extra == "gui"
+Provides-Extra: test
+Requires-Dist: pytest>=8.0; extra == "test"
+Requires-Dist: pillow>=10.0; extra == "test"

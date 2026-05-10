@@ -1,0 +1,15 @@
+version: 2
+jobs:
+  - id: water_single
+    input:
+      path: ../../tests/data/water.xyz
+      frames: last
+    output:
+      path: ../../outputs/water_single.png
+    style:
+      scene_style: default
+    render:
+      engine: eevee
+      samples: 4
+      resolution: [320, 320]
+      transparent_bg: true
