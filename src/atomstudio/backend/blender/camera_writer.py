@@ -30,6 +30,28 @@ def _as_vector3(value: Any, *, default: tuple[float, float, float] | None = None
     return default
 
 
+def _float_value(node: Any, key: str, default: float) -> float:
+    value = _value(node, key)
+    if value is None:
+        value = default
+    return float(value)
+
+
+def _apply_dof(cam: Any, camera: Any, *, fallback_distance: float | None = None) -> None:
+    if not bool(_value(camera, "dof_enabled", False)):
+        return
+    dof = getattr(cam.data, "dof", None)
+    if dof is None:
+        return
+    dof.use_dof = True
+    focus_distance = _value(camera, "focus_distance")
+    if focus_distance is None:
+        focus_distance = fallback_distance if fallback_distance is not None else _value(camera, "distance", None)
+    if focus_distance is not None:
+        dof.focus_distance = max(1e-6, float(focus_distance))
+    dof.aperture_fstop = max(0.1, _float_value(camera, "aperture_fstop", 5.6))
+
+
 class BlenderCameraWriter:
     def __init__(self, cfg: RenderJobConfig) -> None:
         self.cfg = cfg
@@ -62,8 +84,8 @@ class BlenderCameraWriter:
                 cam.rotation_mode = "QUATERNION"
                 cam.rotation_quaternion = (center - cam.location).to_track_quat("-Z", "Y")
             if cam.data.type == "ORTHO":
-                scale_factor = float(_value(camera, "scale_factor", 1.0))
-                cam.data.ortho_scale = max(1e-6, 2.0 * scale_factor)
+                cam.data.ortho_scale = max(1e-6, _float_value(camera, "ortho_scale", _float_value(camera, "scale_factor", 1.0)))
+            _apply_dof(cam, camera, fallback_distance=float((center - cam.location).length))
             bpy.context.scene.camera = cam
             return cam
 
@@ -72,11 +94,11 @@ class BlenderCameraWriter:
         up = Vector(_as_vector3(_value(camera, "up"), default=(0.0, 1.0, 0.0)) or (0.0, 1.0, 0.0))
         forward = Vector(_as_vector3(_value(camera, "forward"), default=(0.0, 0.0, -1.0)) or (0.0, 0.0, -1.0))
         scale_factor = max(1e-6, float(_value(camera, "scale_factor", 1.0)))
-        distance = max(scale_factor * 1.5, 3.0)
+        distance = max(1e-6, _float_value(camera, "distance", max(scale_factor * 1.5, 3.0)))
         cam.location = center - forward.normalized() * distance
 
         if cam.data.type == "ORTHO":
-            cam.data.ortho_scale = max(1e-6, 2.0 * scale_factor)
+            cam.data.ortho_scale = max(1e-6, _float_value(camera, "ortho_scale", scale_factor))
         else:
             fov_deg = max(5.0, min(120.0, float(_value(camera, "fov_degrees", 50.0))))
             needed_distance = max(scale_factor / max(1e-6, tan(radians(fov_deg) * 0.5)), 3.0)
@@ -92,5 +114,6 @@ class BlenderCameraWriter:
         ).to_quaternion()
         cam.rotation_mode = "QUATERNION"
         cam.rotation_quaternion = rot
+        _apply_dof(cam, camera, fallback_distance=float((center - cam.location).length))
         bpy.context.scene.camera = cam
         return cam

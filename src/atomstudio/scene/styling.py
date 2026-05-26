@@ -19,6 +19,7 @@ from atomstudio.style.material_style import tune_rgba
 from atomstudio.style.registry import get_radius_style
 from atomstudio.style.resolver import ResolvedStyleBundle, resolve_style_bundle
 from atomstudio.structure.structure import Structure
+from atomstudio.visual_defaults import HYDROGEN_BOND_LINE_COLOR, HYDROGEN_BOND_RADIUS_SCALE
 
 
 @dataclass(slots=True)
@@ -148,6 +149,8 @@ def resolve_bond_scene_styles(
     if not structure.bonds:
         return []
 
+    atoms = structure.atoms
+    symbols = structure.symbols
     atom_materials = [item.material for item in atom_styles]
     policy = cfg.style.material_policy
     split_by_atom = use_atom_matched_split_bonds(style_bundle.material_style.pipeline, policy)
@@ -162,7 +165,7 @@ def resolve_bond_scene_styles(
     for idx, bond in enumerate(structure.bonds):
         i = int(bond.a)
         j = int(bond.b)
-        if i >= len(structure.atoms) or j >= len(structure.atoms):
+        if i >= len(atoms) or j >= len(atoms):
             continue
 
         visible = bool(draw_bonds)
@@ -172,13 +175,17 @@ def resolve_bond_scene_styles(
             if rep_i != "ball_stick" or rep_j != "ball_stick":
                 visible = False
 
-        distance = float(bond.distance) if float(bond.distance) > 0.0 else _distance(structure.atoms[i].position, structure.atoms[j].position)
+        distance = (
+            float(bond.distance)
+            if float(bond.distance) > 0.0
+            else _distance(atoms[i].position, atoms[j].position)
+        )
         material_uniform = _resolve_bond_material_spec(
             bond=bond,
             i=i,
             j=j,
-            si=structure.symbols[i],
-            sj=structure.symbols[j],
+            si=symbols[i],
+            sj=symbols[j],
             distance=distance,
             atom_materials=atom_materials,
             style_bundle=style_bundle,
@@ -193,16 +200,22 @@ def resolve_bond_scene_styles(
             atom_materials=atom_materials,
             split_by_atom=split_by_atom,
         )
-        split_colors = not material_specs_equivalent(material_left, material_right)
+        bond_type = str(getattr(bond, "bond_type", "covalent"))
+        if bond_type == "hydrogen":
+            material_uniform = replace(material_uniform, color=HYDROGEN_BOND_LINE_COLOR, alpha=HYDROGEN_BOND_LINE_COLOR[3])
+            material_left = material_uniform
+            material_right = material_uniform
+        split_colors = bond_type != "hydrogen" and not material_specs_equivalent(material_left, material_right)
         resolved.append(
             ResolvedBondSceneStyle(
                 bond_id=int(bond.id),
                 a=i,
                 b=j,
                 order=max(1, int(getattr(bond, "order", 1))),
-                bond_type=str(getattr(bond, "bond_type", "covalent")),
+                bond_type=bond_type,
                 distance=distance,
-                radius=float(cfg.structure.bond_radius),
+                radius=float(cfg.structure.bond_radius)
+                * (HYDROGEN_BOND_RADIUS_SCALE if bond_type == "hydrogen" else 1.0),
                 material_uniform=material_uniform,
                 material_left=material_left,
                 material_right=material_right,
@@ -210,9 +223,10 @@ def resolve_bond_scene_styles(
                 split_ratio=float(getattr(bond, "split_ratio", 0.5)),
                 visible=visible,
                 metadata={
+                    **({"preview_bond_style": "dashed"} if bond_type == "hydrogen" else {}),
                     **dict(getattr(bond, "metadata", {}) or {}),
                     "atom_indices": [i, j],
-                    "bond_type": str(getattr(bond, "bond_type", "covalent")),
+                    "bond_type": bond_type,
                     "order": max(1, int(getattr(bond, "order", 1))),
                     "distance": float(distance),
                     "split_ratio": float(getattr(bond, "split_ratio", 0.5)),
@@ -248,8 +262,13 @@ def resolve_cell_material(
         or cfg.structure.cell_style.material
         or style_bundle.material_style.cell_default
     )
+    if cfg.structure.cell_style.color is not None:
+        material = replace(material, color=cfg.structure.cell_style.color)
     if structure.cell.color is not None:
         material = replace(material, color=structure.cell.color)
+    if bool(cfg.structure.cell_style.transparent):
+        color = tuple(float(v) for v in as_material_spec(material).color)
+        material = replace(material, color=(color[0], color[1], color[2], min(color[3], 0.35)), alpha=min(float(color[3]), 0.35))
     return _normalize_material(material, style_bundle=style_bundle, cfg=cfg)
 
 
@@ -406,6 +425,11 @@ def _fallback_bond_material(
     handdrawn_cfg: HanddrawnStyleConfig | None,
 ) -> MaterialLike:
     fallback = style_bundle.material_style.bond_default
+    if i < len(atom_materials) and j < len(atom_materials):
+        c1 = as_material_spec(atom_materials[i]).color
+        c2 = as_material_spec(atom_materials[j]).color
+        avg = ((c1[0] + c2[0]) * 0.5, (c1[1] + c2[1]) * 0.5, (c1[2] + c2[2]) * 0.5, 1.0)
+        fallback = replace(fallback, color=avg)
     if str(style_bundle.material_style.pipeline).strip().lower() != "handdrawn":
         return fallback
     if (

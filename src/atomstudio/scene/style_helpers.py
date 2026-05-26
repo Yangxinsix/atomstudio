@@ -34,7 +34,10 @@ class ResolvedAtomStyleState:
     color: tuple[float, float, float, float] | None
 
 
-def use_atom_matched_split_bonds(material_pipeline: str, policy: MaterialPolicy) -> bool:
+def use_atom_matched_split_bonds(
+    material_pipeline: str,
+    policy: MaterialPolicy,
+) -> bool:
     if policy.bond_defaults:
         return False
     if policy.bond_rules:
@@ -264,9 +267,26 @@ def _apply_atom_style_rule_overrides(*, state: ResolvedAtomStyleState, rule: Ato
 
 
 def _material_spec_base_equal(left: MaterialSpec, right: MaterialSpec, tol: float) -> bool:
-    for field_name in ("roughness", "specular", "metallic", "coat", "coat_roughness", "specular_tint", "alpha"):
+    for field_name in (
+        "roughness",
+        "specular",
+        "metallic",
+        "transmission",
+        "coat",
+        "coat_roughness",
+        "specular_tint",
+        "sheen",
+        "subsurface",
+        "emission_strength",
+        "alpha",
+    ):
         if not _close(float(getattr(left, field_name)), float(getattr(right, field_name)), tol):
             return False
+    if left.emission_color is None or right.emission_color is None:
+        if left.emission_color is not None or right.emission_color is not None:
+            return False
+    elif not _all_close(left.emission_color, right.emission_color, tol):
+        return False
     if not _all_close(left.color, right.color, tol):
         return False
     if left.ior is None or right.ior is None:

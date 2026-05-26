@@ -69,13 +69,16 @@ class MaterialRegistry:
         if pipeline == "handdrawn":
             hd = as_handdrawn_spec(request.material)
             light_dir = ",".join(f"{float(v):.4f}" for v in hd.light_direction)
+            highlight_dir = ",".join(f"{float(v):.4f}" for v in hd.highlight_direction)
             outline2 = ",".join(f"{float(v):.4f}" for v in hd.outline_secondary_color)
             handdrawn_sig = (
                 f"jd={float(hd.jmol_desaturate):.4f}|"
                 f"jl={float(hd.jmol_lighten):.4f}|"
                 f"ld={light_dir}|sa={float(hd.shadow_area):.4f}|"
                 f"ss={float(hd.shadow_strength):.4f}|sf={float(hd.shadow_softness):.4f}|"
-                f"hs={float(hd.highlight_strength):.4f}|"
+                f"hs={float(hd.highlight_strength):.4f}|hd={highlight_dir}|"
+                f"ha={float(hd.highlight_arc_length):.4f}|"
+                f"hbi={float(hd.highlight_band_inner):.4f}|hbo={float(hd.highlight_band_outer):.4f}|"
                 f"os={float(hd.outline_surface):.4f}|om={float(hd.outline_molecule):.4f}|"
                 f"ob={float(hd.outline_bond):.4f}|"
                 f"ot={float(hd.outline_secondary_thickness):.4f}|oc={outline2}"
@@ -85,5 +88,8 @@ class MaterialRegistry:
             f"{tuple(round(v, 6) for v in spec.color)}|"
             f"{spec.roughness:.6f}|{spec.specular:.6f}|{spec.metallic:.6f}|"
             f"{'none' if spec.ior is None else f'{spec.ior:.6f}'}|"
-            f"{spec.coat:.6f}|{spec.coat_roughness:.6f}|{spec.specular_tint:.6f}|{spec.alpha:.6f}"
+            f"{spec.transmission:.6f}|{spec.coat:.6f}|{spec.coat_roughness:.6f}|"
+            f"{spec.specular_tint:.6f}|{spec.sheen:.6f}|{spec.subsurface:.6f}|"
+            f"{'none' if spec.emission_color is None else tuple(round(v, 6) for v in spec.emission_color)}|"
+            f"{spec.emission_strength:.6f}|{spec.alpha:.6f}"
         )

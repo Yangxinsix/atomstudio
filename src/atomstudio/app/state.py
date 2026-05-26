@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -36,39 +37,82 @@ class LoadedFrameBundle:
     frame_selector: str = "all"
     frames: list[Structure] = field(default_factory=list)
     selected_index: int = 0
+    _frame_indices: list[int] = field(default_factory=list, repr=False)
+    _frame_cache: dict[int, Structure] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
+        if not self._frame_indices:
+            self._frame_indices = [int(frame.frame_index) for frame in self.frames]
+        if self.frames:
+            self._frame_cache.update({index: frame for index, frame in enumerate(self.frames)})
         self.selected_index = self._clamp_index(self.selected_index)
+
+    @classmethod
+    def lazy(
+        cls,
+        *,
+        source_path: str,
+        frame_selector: str = "all",
+        frame_indices: list[int],
+        selected_index: int = 0,
+    ) -> "LoadedFrameBundle":
+        return cls(
+            source_path=str(source_path),
+            frame_selector=str(frame_selector),
+            frames=[],
+            selected_index=int(selected_index),
+            _frame_indices=[int(index) for index in frame_indices],
+        )
 
     @property
     def frame_count(self) -> int:
-        return len(self.frames)
+        return len(self._frame_indices)
 
     def _clamp_index(self, index: int) -> int:
-        if not self.frames:
+        if self.frame_count <= 0:
             return 0
-        return max(0, min(int(index), len(self.frames) - 1))
+        return max(0, min(int(index), self.frame_count - 1))
 
     def set_selected_index(self, index: int) -> None:
         self.selected_index = self._clamp_index(index)
 
     def current(self) -> Structure | None:
-        if not self.frames:
+        if self.frame_count <= 0:
             return None
-        return self.frames[self.selected_index]
+        return self.structure_at(self.selected_index)
+
+    def structure_at(self, selected_index: int) -> Structure:
+        index = self._clamp_index(selected_index)
+        cached = self._frame_cache.get(index)
+        if cached is not None:
+            return cached
+        from atomstudio.io.ase_loader import load_frame
+
+        structure = load_frame(self.source_path, self._frame_indices[index])
+        self._frame_cache[index] = structure
+        return structure
+
+    def structures_in_range(self, start: int = 0, end: int | None = None, step: int = 1) -> list[Structure]:
+        stop = self.frame_count if end is None else max(0, min(int(end), self.frame_count))
+        begin = max(0, min(int(start), stop))
+        stride = max(1, int(step))
+        return [self.structure_at(index) for index in range(begin, stop, stride)]
+
+    def cached_structures(self) -> list[Structure]:
+        return [self._frame_cache[index] for index in sorted(self._frame_cache)]
 
     def frame_indices(self) -> list[int]:
-        return [int(frame.frame_index) for frame in self.frames]
+        return [int(index) for index in self._frame_indices]
 
     def to_dict(self) -> dict[str, Any]:
-        current = self.current()
+        current_index = None if self.frame_count <= 0 else self._frame_indices[self.selected_index]
         return {
             "source_path": self.source_path,
             "frame_selector": self.frame_selector,
             "selected_index": int(self.selected_index),
             "frame_count": self.frame_count,
             "frame_indices": self.frame_indices(),
-            "current_frame_index": None if current is None else int(current.frame_index),
+            "current_frame_index": current_index,
         }
 
     @classmethod
@@ -89,6 +133,7 @@ class LoadedFrameBundle:
             frame_selector=str(data.get("frame_selector", "all")),
             frames=frames,
             selected_index=int(data.get("selected_index", 0)),
+            _frame_indices=frame_indices or [int(frame.frame_index) for frame in frames],
         )
 
 
@@ -106,6 +151,17 @@ class DockVisibilityState:
             log_visible=bool(src.get("log_visible", True)),
             axis_overlay_visible=bool(src.get("axis_overlay_visible", True)),
         )
+
+
+@dataclass
+class AppUndoSnapshot:
+    label: str
+    bundle: LoadedFrameBundle | None = None
+    render_config: RenderJobConfig | None = None
+    preview_scene: Any | None = None
+    dirty: bool = False
+    selected_object: PreviewSelection | None = None
+    selected_payload: dict[str, Any] | None = None
 
 
 def _selection_to_dict(selection: PreviewSelection | None) -> dict[str, Any] | None:
@@ -136,6 +192,10 @@ class AppState:
     selected_object: PreviewSelection | None = None
     selected_payload: dict[str, Any] | None = None
     dock_visibility: DockVisibilityState = field(default_factory=DockVisibilityState)
+    wrap_atoms_into_cell: bool = False
+    undo_stack: list[AppUndoSnapshot] = field(default_factory=list, repr=False)
+    redo_stack: list[AppUndoSnapshot] = field(default_factory=list, repr=False)
+    undo_limit: int = 64
 
     def current_structure(self) -> Structure | None:
         if self.bundle is None:
@@ -163,6 +223,7 @@ class AppState:
         self.dirty = False
         self.last_error = None
         self.status = status or f"Loaded {bundle.frame_count} frame(s)"
+        self.clear_history()
         self.append_log("info", f"Loaded {bundle.frame_count} frame(s) from {bundle.source_path}")
 
     def set_render_config(self, cfg: RenderJobConfig | None, *, mark_dirty: bool = False) -> None:
@@ -215,6 +276,70 @@ class AppState:
     def clear_selection(self) -> None:
         self.set_selection(None, payload=None)
 
+    def capture_undo_snapshot(self, label: str) -> AppUndoSnapshot:
+        return AppUndoSnapshot(
+            label=str(label),
+            bundle=deepcopy(self.bundle),
+            render_config=deepcopy(self.render_config),
+            preview_scene=deepcopy(self.preview_scene),
+            dirty=bool(self.dirty),
+            selected_object=deepcopy(self.selected_object),
+            selected_payload=deepcopy(self.selected_payload),
+        )
+
+    def push_undo_snapshot(self, snapshot: AppUndoSnapshot) -> None:
+        self.undo_stack.append(deepcopy(snapshot))
+        if len(self.undo_stack) > int(self.undo_limit):
+            del self.undo_stack[: len(self.undo_stack) - int(self.undo_limit)]
+        self.redo_stack.clear()
+
+    def push_undo(self, label: str) -> AppUndoSnapshot:
+        snapshot = self.capture_undo_snapshot(label)
+        self.push_undo_snapshot(snapshot)
+        return snapshot
+
+    def can_undo(self) -> bool:
+        return bool(self.undo_stack)
+
+    def can_redo(self) -> bool:
+        return bool(self.redo_stack)
+
+    def undo_label(self) -> str:
+        return self.undo_stack[-1].label if self.undo_stack else ""
+
+    def redo_label(self) -> str:
+        return self.redo_stack[-1].label if self.redo_stack else ""
+
+    def restore_snapshot(self, snapshot: AppUndoSnapshot) -> None:
+        self.bundle = deepcopy(snapshot.bundle)
+        self.render_config = deepcopy(snapshot.render_config)
+        self.preview_scene = deepcopy(snapshot.preview_scene)
+        self.dirty = bool(snapshot.dirty)
+        self.selected_object = deepcopy(snapshot.selected_object)
+        self.selected_payload = deepcopy(snapshot.selected_payload)
+
+    def undo(self) -> AppUndoSnapshot | None:
+        if not self.undo_stack:
+            return None
+        target = self.undo_stack.pop()
+        self.redo_stack.append(self.capture_undo_snapshot(target.label))
+        self.restore_snapshot(target)
+        self.status = f"Undid {target.label}"
+        return target
+
+    def redo(self) -> AppUndoSnapshot | None:
+        if not self.redo_stack:
+            return None
+        target = self.redo_stack.pop()
+        self.undo_stack.append(self.capture_undo_snapshot(target.label))
+        self.restore_snapshot(target)
+        self.status = f"Redid {target.label}"
+        return target
+
+    def clear_history(self) -> None:
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+
     def set_dock_visibility(
         self,
         *,
@@ -241,6 +366,7 @@ class AppState:
             "selected_object": _selection_to_dict(self.selected_object),
             "selected_payload": self.selected_payload,
             "dock_visibility": asdict(self.dock_visibility),
+            "wrap_atoms_into_cell": bool(self.wrap_atoms_into_cell),
         }
 
     @classmethod
@@ -262,6 +388,7 @@ class AppState:
                 dict(data["selected_payload"]) if isinstance(data.get("selected_payload"), dict) else None
             ),
             dock_visibility=DockVisibilityState.from_dict(data.get("dock_visibility")),
+            wrap_atoms_into_cell=bool(data.get("wrap_atoms_into_cell", False)),
         )
 
     def title_suffix(self) -> str:

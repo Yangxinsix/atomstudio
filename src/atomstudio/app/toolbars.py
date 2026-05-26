@@ -51,6 +51,20 @@ def build_view_toolbar(window: Any) -> ToolbarHandles:
         handles.controls[key] = spinbox
         return spinbox
 
+    def add_angle_control(key: str, label: str) -> Any:
+        toolbar.addWidget(QtWidgets.QLabel(label, toolbar))
+        spinbox = QtWidgets.QDoubleSpinBox(toolbar)
+        spinbox.setDecimals(1)
+        spinbox.setRange(-3600.0, 3600.0)
+        spinbox.setSingleStep(1.0)
+        spinbox.setKeyboardTracking(True)
+        spinbox.setMaximumWidth(68)
+        spinbox.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
+        spinbox.valueChanged.connect(lambda _value: window.set_preview_model_rotation_from_toolbar())
+        toolbar.addWidget(spinbox)
+        handles.controls[key] = spinbox
+        return spinbox
+
     add("view_axis_a", "a", lambda: window.set_preview_axis_view("a"), "View perpendicular to a / x axis")
     add("view_axis_b", "b", lambda: window.set_preview_axis_view("b"), "View perpendicular to b / y axis")
     add("view_axis_c", "c", lambda: window.set_preview_axis_view("c"), "View perpendicular to c / z axis")
@@ -69,6 +83,10 @@ def build_view_toolbar(window: Any) -> ToolbarHandles:
             lambda _checked=False, value=axis: window.rotate_preview_view(value, 1, window.view_rotation_step_degrees()),
             f"Rotate clockwise around {axis} axis",
         )
+    toolbar.addSeparator()
+    add_angle_control("rotation_x_degrees", "X:")
+    add_angle_control("rotation_y_degrees", "Y:")
+    add_angle_control("rotation_z_degrees", "Z:")
     add_step_control("rotation_step_degrees", "step (deg):", 15.0, 0.1, 360.0, 1)
     toolbar.addSeparator()
 

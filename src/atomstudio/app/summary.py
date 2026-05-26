@@ -51,7 +51,7 @@ def build_structure_summary(
 def _graphics_lines(graphics: dict[str, Any]) -> list[str]:
     version = graphics.get("opengl_version") or "unavailable"
     renderer = graphics.get("renderer") or graphics.get("video_configuration") or "unavailable"
-    viewport = graphics.get("max_viewport_dims") or "unavailable"
+    viewport = _format_viewport(graphics.get("max_viewport_dims"))
     depth = graphics.get("depth_bits")
     if depth is None:
         depth = "unavailable"
@@ -65,14 +65,49 @@ def _graphics_lines(graphics: dict[str, Any]) -> list[str]:
         ("Qt platform", graphics.get("qt_platform")),
         ("VisPy backend", graphics.get("vispy_backend")),
         ("GL backend", graphics.get("gl_backend")),
+        ("OpenGL vendor", graphics.get("vendor")),
+        ("Software renderer", graphics.get("software_renderer")),
         ("Instancing requested", graphics.get("instancing_requested")),
         ("Instancing supported", graphics.get("instancing_supported")),
         ("Instancing reason", graphics.get("instancing_reason")),
         ("Preview renderer", graphics.get("preview_renderer")),
+        ("OpenGL shader style", graphics.get("shader_style")),
+        ("OpenGL shader style choices", graphics.get("shader_style_choices")),
+        ("Preview draw calls", graphics.get("last_frame_draw_calls")),
+        ("Scene uploads", graphics.get("scene_upload_count")),
+        ("Repaint throttle Hz", graphics.get("repaint_throttle_hz")),
+        ("Interaction driver policy", graphics.get("interaction_driver_policy")),
+        ("Interaction timer ms", graphics.get("interaction_timer_ms")),
+        ("Interaction repaint policy", graphics.get("interaction_repaint_policy")),
+        ("Requested depth bits", graphics.get("requested_depth_bits")),
+        ("Requested MSAA samples", graphics.get("requested_samples")),
+        ("Requested swap interval", graphics.get("requested_swap_interval")),
+        ("Qt surface", graphics.get("qt_surface_format")),
         ("DISPLAY", graphics.get("display")),
         ("WAYLAND_DISPLAY", graphics.get("wayland_display")),
+        ("XDG_SESSION_TYPE", graphics.get("xdg_session_type")),
+        ("QT_QPA_PLATFORM", graphics.get("qt_qpa_platform")),
+        ("QT_OPENGL", graphics.get("qt_opengl")),
+        ("PYOPENGL_PLATFORM", graphics.get("pyopengl_platform")),
+        ("GALLIUM_DRIVER", graphics.get("gallium_driver")),
+        ("MESA_D3D12_DEFAULT_ADAPTER_NAME", graphics.get("mesa_d3d12_default_adapter_name")),
+        ("LIBGL_ALWAYS_SOFTWARE", graphics.get("libgl_always_software")),
+        ("LIBGL_DRIVERS_PATH", graphics.get("libgl_drivers_path")),
+        ("MESA_LOADER_DRIVER_OVERRIDE", graphics.get("mesa_loader_driver_override")),
+        ("ATOMSTUDIO_GL_PROFILE", graphics.get("atomstudio_gl_profile")),
+        ("ATOMSTUDIO_GL_ADAPTER", graphics.get("atomstudio_gl_adapter")),
+        ("ATOMSTUDIO_INTERACTION_DRIVER", graphics.get("atomstudio_interaction_driver")),
+        ("ATOMSTUDIO_INTERACTION_TIMER_MS", graphics.get("atomstudio_interaction_timer_ms")),
+        ("ATOMSTUDIO_INTERACTION_REPAINT", graphics.get("atomstudio_interaction_repaint")),
+        ("ATOMSTUDIO_GL_DEPTH_BITS", graphics.get("atomstudio_gl_depth_bits")),
+        ("ATOMSTUDIO_GL_SAMPLES", graphics.get("atomstudio_gl_samples")),
+        ("ATOMSTUDIO_GL_SWAP_INTERVAL", graphics.get("atomstudio_gl_swap_interval")),
+        ("ATOMSTUDIO_GL_VSYNC", graphics.get("atomstudio_gl_vsync")),
+        ("vblank_mode", graphics.get("vblank_mode")),
+        ("__GL_SYNC_TO_VBLANK", graphics.get("__gl_sync_to_vblank")),
+        ("WSL_DISTRO_NAME", graphics.get("wsl_distro_name")),
     ]
-    lines.extend(f"{label}: {value}" for label, value in diagnostics if value)
+    lines.extend(f"{label}: {value}" for label, value in diagnostics if value is not None and value != "")
     instances = graphics.get("preview_instances")
     if isinstance(instances, dict):
         lines.append(
@@ -82,6 +117,17 @@ def _graphics_lines(graphics: dict[str, Any]) -> list[str]:
             f"bond_segments={instances.get('bond_segments', 0)}"
         )
     return lines
+
+
+def _format_viewport(value: Any) -> str:
+    if value is None or value == "":
+        return "unavailable"
+    if isinstance(value, (list, tuple)) and len(value) >= 2:
+        try:
+            return f"{int(value[0])} x {int(value[1])}"
+        except (TypeError, ValueError):
+            return str(value)
+    return str(value)
 
 
 def _title(structure: Any | None) -> str:

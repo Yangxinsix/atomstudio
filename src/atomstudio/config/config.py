@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from atomstudio.color_utils import rgba_from_any
+from atomstudio.color_utils import coerce_color_fields, rgba_from_any
 from atomstudio.scene.lights.specs import LightSpec as LightConfig
 from atomstudio.scene.materials.specs import (
     HandDrawnMaterialSpec,
@@ -18,6 +18,18 @@ from atomstudio.structure.selectors import AtomSelector, BondSelector, norm_inde
 
 def _copy_dict(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
+
+
+def _jsonable_config(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): _jsonable_config(v) for k, v in value.items()}
+    if isinstance(value, set):
+        return sorted(_jsonable_config(v) for v in value)
+    if isinstance(value, tuple):
+        return [_jsonable_config(v) for v in value]
+    if isinstance(value, list):
+        return [_jsonable_config(v) for v in value]
+    return value
 
 
 def _reject_unknown_keys(src: dict[str, Any], *, allowed: set[str], context: str) -> None:
@@ -49,6 +61,12 @@ def _to_rgba(value: Any, fallback: tuple[float, float, float, float] = (0.5, 0.5
     return rgba_from_any(value, fallback=fallback)
 
 
+def _to_float_tuple(value: Any, *, length: int) -> tuple[float, ...] | None:
+    if not isinstance(value, (list, tuple)) or len(value) != int(length):
+        return None
+    return tuple(float(item) for item in value)
+
+
 def _normalize_atom_representation(value: Any, *, allow_none: bool = True, label: str = "representation") -> str | None:
     if value is None:
         if allow_none:
@@ -76,6 +94,46 @@ def _parse_space_filling_scale(value: Any) -> float | str:
     if parsed <= 0.0:
         raise ValueError("structure.space_filling_scale must be > 0 or 'auto'.")
     return parsed
+
+
+def _parse_disabled_pair_keys(value: Any, *, context: str) -> list[str]:
+    if value in (None, ""):
+        return []
+    if not isinstance(value, (list, tuple, set)):
+        raise ValueError(f"{context} must be a list of element pairs like ['O-Ti'].")
+    out: set[str] = set()
+    for item in value:
+        key = str(item).strip()
+        if "-" not in key:
+            raise ValueError(f"{context} keys must be element pairs like 'O-Ti'.")
+        left, right = key.split("-", 1)
+        out.add(norm_symbol_pair(left.strip(), right.strip()))
+    return sorted(out)
+
+
+def _parse_pair_order_rules(value: Any, *, context: str) -> dict[str, int]:
+    if value in (None, ""):
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"{context} must be a mapping like {{'C-O': 2}}.")
+    out: dict[str, int] = {}
+    for raw_key, raw_value in value.items():
+        key = str(raw_key).strip()
+        if "-" not in key:
+            raise ValueError(f"{context} keys must be element pairs like 'C-O'.")
+        left, right = key.split("-", 1)
+        if isinstance(raw_value, dict):
+            raw_order = raw_value.get("order")
+        else:
+            raw_order = raw_value
+        try:
+            order = int(raw_order)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{context} values must be 1, 2, or 3.") from exc
+        if order not in {1, 2, 3}:
+            raise ValueError(f"{context} values must be 1, 2, or 3.")
+        out[norm_symbol_pair(left.strip(), right.strip())] = order
+    return dict(sorted(out.items()))
 
 
 def _merge_material_override(material: MaterialLike, base_material: MaterialLike) -> MaterialLike:
@@ -268,15 +326,24 @@ class MaterialPolicy:
 @dataclass
 class CellStyleConfig:
     show: bool = False
-    radius: float = 0.04
+    radius: float = 0.01
     material: MaterialLike | None = None
+    color: tuple[float, float, float, float] | None = None
+    transparent: bool = False
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "CellStyleConfig":
         src = {} if data is None else dict(data)
+        _reject_unknown_keys(src, allowed={"show", "radius", "material", "color", "transparent"}, context="structure.cell_style")
         material_data = src.get("material")
         material = material_from_dict(_copy_dict(material_data)) if isinstance(material_data, dict) else None
-        return cls(show=bool(src.get("show", False)), radius=float(src.get("radius", 0.04)), material=material)
+        return cls(
+            show=bool(src.get("show", False)),
+            radius=float(src.get("radius", 0.01)),
+            material=material,
+            color=_to_rgba(src.get("color")) if src.get("color") is not None else None,
+            transparent=bool(src.get("transparent", False)),
+        )
 
 
 @dataclass
@@ -297,59 +364,106 @@ class SurfaceOptions:
 
 @dataclass
 class HBondConfig:
-    enabled: bool = False
+    enabled: bool = True
     donors: list[str] = field(default_factory=lambda: ["N", "O"])
     acceptors: list[str] = field(default_factory=lambda: ["N", "O"])
     max_distance: float = 2.5
     min_angle_deg: float = 120.0
+    pair_distances: dict[str, tuple[float, float]] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "HBondConfig":
         src = {} if data is None else dict(data)
+        _reject_unknown_keys(
+            src,
+            allowed={"enabled", "donors", "acceptors", "max_distance", "min_angle_deg", "pair_distances"},
+            context="structure.bonding.hbond",
+        )
+        pair_distances_raw = src.get("pair_distances", {})
+        if not isinstance(pair_distances_raw, dict):
+            raise ValueError("structure.bonding.hbond.pair_distances must be a mapping like {'H-O': [1.2, 2.1]}.")
+        pair_distances: dict[str, tuple[float, float]] = {}
+        for raw_key, raw_value in pair_distances_raw.items():
+            key = str(raw_key).strip()
+            if "-" not in key:
+                raise ValueError("structure.bonding.hbond.pair_distances keys must be element pairs like 'H-O'.")
+            left, right = key.split("-", 1)
+            norm_key = norm_symbol_pair(left.strip(), right.strip())
+            if isinstance(raw_value, dict):
+                raw_min = raw_value.get("min_distance", raw_value.get("min", 0.0))
+                raw_max = raw_value.get("max_distance", raw_value.get("max"))
+            elif isinstance(raw_value, (list, tuple)) and len(raw_value) == 2:
+                raw_min, raw_max = raw_value
+            else:
+                raise ValueError("structure.bonding.hbond.pair_distances values must be [min, max] or mappings.")
+            if raw_max is None:
+                raise ValueError("structure.bonding.hbond.pair_distances values require max_distance.")
+            min_distance = float(raw_min)
+            max_distance = float(raw_max)
+            if min_distance < 0.0 or max_distance <= min_distance:
+                raise ValueError("structure.bonding.hbond.pair_distances values must satisfy 0 <= min < max.")
+            pair_distances[norm_key] = (min_distance, max_distance)
         return cls(
-            enabled=bool(src.get("enabled", False)),
+            enabled=bool(src.get("enabled", True)),
             donors=[str(v) for v in src.get("donors", ["N", "O"])],
             acceptors=[str(v) for v in src.get("acceptors", ["N", "O"])],
             max_distance=float(src.get("max_distance", 2.5)),
             min_angle_deg=float(src.get("min_angle_deg", 120.0)),
+            pair_distances=dict(sorted(pair_distances.items())),
         )
 
 
 @dataclass
 class BondingConfig:
     mode: str = "covalent"
-    cutoff_scale: float = 1.1
-    min_distance: float = 0.2
     include_periodic_images: bool = False
-    pair_cutoffs: dict[str, float] = field(default_factory=dict)
+    pair_distances: dict[str, tuple[float, float]] = field(default_factory=dict)
+    disabled_pairs: list[str] = field(default_factory=list)
     hbond: HBondConfig = field(default_factory=HBondConfig)
-    order_rules: dict[str, Any] = field(default_factory=dict)
+    order_rules: dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "BondingConfig":
         src = {} if data is None else dict(data)
-        pair_cutoffs_raw = src.get("pair_cutoffs", {})
-        if not isinstance(pair_cutoffs_raw, dict):
-            raise ValueError("structure.bonding.pair_cutoffs must be a mapping like {'O-Ti': 2.3}.")
-        pair_cutoffs: dict[str, float] = {}
-        for raw_key, raw_value in pair_cutoffs_raw.items():
+        _reject_unknown_keys(
+            src,
+            allowed={"mode", "include_periodic_images", "pair_distances", "disabled_pairs", "hbond", "order_rules"},
+            context="structure.bonding",
+        )
+        pair_distances_raw = src.get("pair_distances", {})
+        if not isinstance(pair_distances_raw, dict):
+            raise ValueError("structure.bonding.pair_distances must be a mapping like {'O-Ti': [0.0, 2.3]}.")
+        pair_distances: dict[str, tuple[float, float]] = {}
+        for raw_key, raw_value in pair_distances_raw.items():
             key = str(raw_key).strip()
             if "-" not in key:
-                raise ValueError("structure.bonding.pair_cutoffs keys must be element pairs like 'O-Ti'.")
+                raise ValueError("structure.bonding.pair_distances keys must be element pairs like 'O-Ti'.")
             left, right = key.split("-", 1)
             norm_key = norm_symbol_pair(left.strip(), right.strip())
-            cutoff = float(raw_value)
-            if cutoff <= 0.0:
-                raise ValueError("structure.bonding.pair_cutoffs values must be > 0 (Angstrom).")
-            pair_cutoffs[norm_key] = cutoff
+            if isinstance(raw_value, dict):
+                raw_min = raw_value.get("min_distance", raw_value.get("min", 0.0))
+                raw_max = raw_value.get("max_distance", raw_value.get("max"))
+            elif isinstance(raw_value, (list, tuple)) and len(raw_value) == 2:
+                raw_min, raw_max = raw_value
+            else:
+                raise ValueError("structure.bonding.pair_distances values must be [min, max] or mappings.")
+            if raw_max is None:
+                raise ValueError("structure.bonding.pair_distances values require max_distance.")
+            min_distance = float(raw_min)
+            max_distance = float(raw_max)
+            if min_distance < 0.0:
+                raise ValueError("structure.bonding.pair_distances minimum values must be >= 0 (Angstrom).")
+            if max_distance <= min_distance:
+                raise ValueError("structure.bonding.pair_distances maximum values must be > minimum values.")
+            pair_distances[norm_key] = (min_distance, max_distance)
+        disabled_pairs = _parse_disabled_pair_keys(src.get("disabled_pairs", []), context="structure.bonding.disabled_pairs")
         return cls(
             mode=str(src.get("mode", "covalent")),
-            cutoff_scale=float(src.get("cutoff_scale", 1.1)),
-            min_distance=float(src.get("min_distance", 0.2)),
             include_periodic_images=bool(src.get("include_periodic_images", False)),
-            pair_cutoffs=dict(sorted(pair_cutoffs.items())),
+            pair_distances=dict(sorted(pair_distances.items())),
+            disabled_pairs=disabled_pairs,
             hbond=HBondConfig.from_dict(_copy_dict(src.get("hbond"))),
-            order_rules=_copy_dict(src.get("order_rules")),
+            order_rules=_parse_pair_order_rules(src.get("order_rules", {}), context="structure.bonding.order_rules"),
         )
 
 
@@ -460,6 +574,21 @@ class BoundaryConfig:
 
 
 @dataclass
+class BoundaryAtomsConfig:
+    enabled: bool = True
+    sigma: float = 0.03
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "BoundaryAtomsConfig":
+        src = {} if data is None else dict(data)
+        _reject_unknown_keys(src, allowed={"enabled", "sigma"}, context="structure.boundary_atoms")
+        sigma = float(src.get("sigma", 0.03))
+        if sigma < 0.0 or sigma >= 0.5:
+            raise ValueError("structure.boundary_atoms.sigma must satisfy 0 <= sigma < 0.5.")
+        return cls(enabled=bool(src.get("enabled", True)), sigma=sigma)
+
+
+@dataclass
 class StructureConfig:
     representation: str = "auto"
     atom_scale: float = 1.0
@@ -470,7 +599,7 @@ class StructureConfig:
     bond_radius: float = 0.08
     draw_bonds: bool | None = None
     draw_surface_bonds: bool = True
-    draw_cell: bool = False
+    draw_cell: bool = True
     model_rotation: str | None = None
     model_view: str = "top"
     sphere_segments: int = 32
@@ -482,6 +611,7 @@ class StructureConfig:
     bonding: BondingConfig = field(default_factory=BondingConfig)
     polyhedra: PolyhedraConfig = field(default_factory=PolyhedraConfig)
     boundary: BoundaryConfig = field(default_factory=BoundaryConfig)
+    boundary_atoms: BoundaryAtomsConfig = field(default_factory=BoundaryAtomsConfig)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "StructureConfig":
@@ -509,13 +639,14 @@ class StructureConfig:
                 "bonding",
                 "polyhedra",
                 "boundary",
+                "boundary_atoms",
                 "bond_cutoff_scale",
             },
             context="structure",
         )
         if "bond_cutoff_scale" in src:
             raise ValueError(
-                "structure.bond_cutoff_scale has been removed. Use structure.bonding.cutoff_scale."
+                "structure.bond_cutoff_scale has been removed. Use structure.bonding.pair_distances."
             )
         draw_bonds_raw = src.get("draw_bonds", None)
         draw_bonds = None if draw_bonds_raw is None else bool(draw_bonds_raw)
@@ -535,7 +666,7 @@ class StructureConfig:
             bond_radius=float(src.get("bond_radius", 0.08)),
             draw_bonds=draw_bonds,
             draw_surface_bonds=bool(src.get("draw_surface_bonds", True)),
-            draw_cell=bool(src.get("draw_cell", False)),
+            draw_cell=bool(src.get("draw_cell", True)),
             model_rotation=str(src["model_rotation"]) if src.get("model_rotation") is not None else None,
             model_view=str(src.get("model_view", "top")).strip().lower(),
             sphere_segments=int(src.get("sphere_segments", 32)),
@@ -547,6 +678,7 @@ class StructureConfig:
             bonding=BondingConfig.from_dict(bonding_raw),
             polyhedra=PolyhedraConfig.from_dict(_copy_dict(src.get("polyhedra"))),
             boundary=BoundaryConfig.from_dict(_copy_dict(src.get("boundary"))),
+            boundary_atoms=BoundaryAtomsConfig.from_dict(_copy_dict(src.get("boundary_atoms"))),
         )
 
 
@@ -841,9 +973,14 @@ class CameraConfig:
     position: tuple[float, float, float] | None = None
     rotation_euler: tuple[float, float, float] | None = None
     rotation: str | None = None
+    model_rotation: tuple[float, ...] | None = None
+    model_translation: tuple[float, float, float] | None = None
     view: str = "top"
     frame_scale: float = 1.0
     ase_view: ASEViewConfig = field(default_factory=ASEViewConfig)
+    dof_enabled: bool = False
+    focus_distance: float | None = None
+    aperture_fstop: float = 5.6
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "CameraConfig":
@@ -866,9 +1003,14 @@ class CameraConfig:
                 "position",
                 "rotation_euler",
                 "rotation",
+                "model_rotation",
+                "model_translation",
                 "view",
                 "frame_scale",
                 "ase_view",
+                "dof_enabled",
+                "focus_distance",
+                "aperture_fstop",
                 "ase_rotation",
             },
             context="camera",
@@ -901,9 +1043,14 @@ class CameraConfig:
             position=tuple(float(v) for v in pos) if isinstance(pos, (list, tuple)) and len(pos) == 3 else None,
             rotation_euler=tuple(float(v) for v in rot) if isinstance(rot, (list, tuple)) and len(rot) == 3 else None,
             rotation=str(src["rotation"]) if src.get("rotation") is not None else None,
+            model_rotation=_to_float_tuple(src.get("model_rotation"), length=16),
+            model_translation=_to_float_tuple(src.get("model_translation"), length=3),
             view=view,
             frame_scale=frame_scale,
             ase_view=ASEViewConfig.from_dict(_copy_dict(src.get("ase_view"))),
+            dof_enabled=bool(src.get("dof_enabled", False)),
+            focus_distance=float(src["focus_distance"]) if src.get("focus_distance") is not None else None,
+            aperture_fstop=max(0.1, float(src.get("aperture_fstop", 5.6))),
         )
 
 
@@ -919,6 +1066,9 @@ class GroundPlaneConfig:
     color: tuple[float, float, float, float] = (0.88, 0.88, 0.88, 1.0)
     roughness: float = 0.82
     specular: float = 0.05
+    metallic: float = 0.0
+    coat: float = 0.0
+    coat_roughness: float = 0.08
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "GroundPlaneConfig":
@@ -937,6 +1087,98 @@ class GroundPlaneConfig:
             color=_to_rgba(src.get("color"), fallback=(0.88, 0.88, 0.88, 1.0)),
             roughness=float(src.get("roughness", 0.82)),
             specular=float(src.get("specular", 0.05)),
+            metallic=float(src.get("metallic", 0.0)),
+            coat=float(src.get("coat", 0.0)),
+            coat_roughness=float(src.get("coat_roughness", 0.08)),
+        )
+
+
+@dataclass
+class StudioSweepConfig:
+    enabled: bool = False
+    width_scale: float = 8.0
+    width_segments: int = 32
+    floor_depth_scale: float = 6.0
+    wall_height_scale: float = 6.0
+    radius_scale: float = 1.4
+    floor_offset_scale: float = 0.02
+    wall_offset_scale: float = 0.40
+    segments: int = 32
+    color: tuple[float, float, float, float] = (0.76, 0.78, 0.79, 1.0)
+    roughness: float = 0.62
+    specular: float = 0.10
+    metallic: float = 0.0
+    coat: float = 0.04
+    coat_roughness: float = 0.32
+    gradient_enabled: bool = False
+    bottom_color: tuple[float, float, float, float] | None = None
+    top_color: tuple[float, float, float, float] | None = None
+    spot_color: tuple[float, float, float, float] | None = None
+    spot_strength: float = 0.0
+    spot_x: float = 0.50
+    spot_y: float = 0.72
+    spot_radius: float = 0.32
+    vignette_strength: float = 0.0
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "StudioSweepConfig":
+        src = {} if data is None else dict(data)
+        _reject_unknown_keys(
+            src,
+            allowed={
+                "enabled",
+                "width_scale",
+                "width_segments",
+                "floor_depth_scale",
+                "wall_height_scale",
+                "radius_scale",
+                "floor_offset_scale",
+                "wall_offset_scale",
+                "segments",
+                "color",
+                "roughness",
+                "specular",
+                "metallic",
+                "coat",
+                "coat_roughness",
+                "gradient_enabled",
+                "bottom_color",
+                "top_color",
+                "spot_color",
+                "spot_strength",
+                "spot_x",
+                "spot_y",
+                "spot_radius",
+                "vignette_strength",
+            },
+            context="lighting.sweep",
+        )
+        color = _to_rgba(src.get("color"), fallback=(0.76, 0.78, 0.79, 1.0))
+        return cls(
+            enabled=bool(src.get("enabled", False)),
+            width_scale=float(src.get("width_scale", 8.0)),
+            width_segments=max(1, int(src.get("width_segments", 32))),
+            floor_depth_scale=float(src.get("floor_depth_scale", 6.0)),
+            wall_height_scale=float(src.get("wall_height_scale", 6.0)),
+            radius_scale=float(src.get("radius_scale", 1.4)),
+            floor_offset_scale=float(src.get("floor_offset_scale", 0.02)),
+            wall_offset_scale=float(src.get("wall_offset_scale", 0.40)),
+            segments=max(4, int(src.get("segments", 32))),
+            color=color,
+            roughness=float(src.get("roughness", 0.62)),
+            specular=float(src.get("specular", 0.10)),
+            metallic=float(src.get("metallic", 0.0)),
+            coat=float(src.get("coat", 0.04)),
+            coat_roughness=float(src.get("coat_roughness", 0.32)),
+            gradient_enabled=bool(src.get("gradient_enabled", False)),
+            bottom_color=_to_rgba(src.get("bottom_color"), fallback=color) if src.get("bottom_color") is not None else None,
+            top_color=_to_rgba(src.get("top_color"), fallback=color) if src.get("top_color") is not None else None,
+            spot_color=_to_rgba(src.get("spot_color"), fallback=(1.0, 1.0, 1.0, 1.0)) if src.get("spot_color") is not None else None,
+            spot_strength=float(src.get("spot_strength", 0.0)),
+            spot_x=float(src.get("spot_x", 0.50)),
+            spot_y=float(src.get("spot_y", 0.72)),
+            spot_radius=max(0.01, float(src.get("spot_radius", 0.32))),
+            vignette_strength=float(src.get("vignette_strength", 0.0)),
         )
 
 
@@ -946,17 +1188,240 @@ class LightingConfig:
     intensity: float = 1.0
     lights: list[LightConfig] = field(default_factory=list)
     ground: GroundPlaneConfig = field(default_factory=GroundPlaneConfig)
+    sweep: StudioSweepConfig = field(default_factory=StudioSweepConfig)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "LightingConfig":
         src = {} if data is None else dict(data)
-        _reject_unknown_keys(src, allowed={"light_style", "intensity", "lights", "ground", "preset"}, context="lighting")
+        _reject_unknown_keys(src, allowed={"light_style", "intensity", "lights", "ground", "sweep", "preset"}, context="lighting")
         if "preset" in src:
             raise ValueError("lighting.preset has been removed. Use lighting.light_style.")
         light_style = str(src["light_style"]) if src.get("light_style") is not None else None
         lights = [LightConfig.from_dict(item if isinstance(item, dict) else {}) for item in src.get("lights", [])]
         ground = GroundPlaneConfig.from_dict(_copy_dict(src.get("ground")))
-        return cls(light_style=light_style, intensity=float(src.get("intensity", 1.0)), lights=lights, ground=ground)
+        sweep = StudioSweepConfig.from_dict(_copy_dict(src.get("sweep")))
+        return cls(light_style=light_style, intensity=float(src.get("intensity", 1.0)), lights=lights, ground=ground, sweep=sweep)
+
+
+@dataclass
+class HDRIConfig:
+    enabled: bool = False
+    path: str | None = None
+    strength: float = 0.8
+    visible_to_camera: bool = False
+    rotation_z: float = 0.0
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "HDRIConfig":
+        src = {} if data is None else dict(data)
+        _reject_unknown_keys(src, allowed={"enabled", "path", "strength", "visible_to_camera", "rotation_z"}, context="render.effects.hdri")
+        return cls(
+            enabled=bool(src.get("enabled", False)),
+            path=str(src["path"]) if src.get("path") is not None else None,
+            strength=float(src.get("strength", 0.8)),
+            visible_to_camera=bool(src.get("visible_to_camera", False)),
+            rotation_z=float(src.get("rotation_z", 0.0)),
+        )
+
+
+@dataclass
+class AmbientOcclusionConfig:
+    enabled: bool = False
+    factor: float = 0.7
+    distance: float = 3.0
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "AmbientOcclusionConfig":
+        src = {} if data is None else dict(data)
+        _reject_unknown_keys(src, allowed={"enabled", "factor", "distance"}, context="render.effects.ambient_occlusion")
+        return cls(enabled=bool(src.get("enabled", False)), factor=float(src.get("factor", 0.7)), distance=float(src.get("distance", 3.0)))
+
+
+@dataclass
+class BloomConfig:
+    enabled: bool = False
+    threshold: float = 0.85
+    intensity: float = 0.18
+    size: int = 6
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "BloomConfig":
+        src = {} if data is None else dict(data)
+        _reject_unknown_keys(src, allowed={"enabled", "threshold", "intensity", "size"}, context="render.effects.bloom")
+        return cls(
+            enabled=bool(src.get("enabled", False)),
+            threshold=float(src.get("threshold", 0.85)),
+            intensity=float(src.get("intensity", 0.18)),
+            size=int(src.get("size", 6)),
+        )
+
+
+@coerce_color_fields("color", label_prefix="render.effects.atmosphere")
+@dataclass
+class AtmosphereConfig:
+    enabled: bool = False
+    density: float = 0.0
+    color: tuple[float, float, float, float] = (0.82, 0.88, 0.94, 1.0)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "AtmosphereConfig":
+        src = {} if data is None else dict(data)
+        _reject_unknown_keys(src, allowed={"enabled", "density", "color"}, context="render.effects.atmosphere")
+        return cls(
+            enabled=bool(src.get("enabled", False)),
+            density=float(src.get("density", 0.0)),
+            color=_to_rgba(src.get("color"), fallback=(0.82, 0.88, 0.94, 1.0)),
+        )
+
+
+@coerce_color_fields("color", label_prefix="render.effects.volumetric_light")
+@dataclass
+class VolumetricLightConfig:
+    enabled: bool = False
+    density: float = 0.0
+    anisotropy: float = 0.0
+    color: tuple[float, float, float, float] = (1.0, 1.0, 1.0, 1.0)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "VolumetricLightConfig":
+        src = {} if data is None else dict(data)
+        _reject_unknown_keys(src, allowed={"enabled", "density", "anisotropy", "color"}, context="render.effects.volumetric_light")
+        return cls(
+            enabled=bool(src.get("enabled", False)),
+            density=float(src.get("density", 0.0)),
+            anisotropy=float(src.get("anisotropy", 0.0)),
+            color=_to_rgba(src.get("color"), fallback=(1.0, 1.0, 1.0, 1.0)),
+        )
+
+
+@coerce_color_fields("color", label_prefix="render.effects.sunbeam")
+@dataclass
+class SunbeamConfig:
+    enabled: bool = False
+    color: tuple[float, float, float, float] = (1.0, 0.78, 0.46, 1.0)
+    strength: float = 0.18
+    width: float = 0.22
+    softness: float = 0.65
+    start: tuple[float, float] = (0.92, 0.94)
+    end: tuple[float, float] = (0.40, 0.44)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "SunbeamConfig":
+        src = {} if data is None else dict(data)
+        _reject_unknown_keys(
+            src,
+            allowed={"enabled", "color", "strength", "width", "softness", "start", "end"},
+            context="render.effects.sunbeam",
+        )
+        start = _to_float_tuple(src.get("start"), length=2)
+        end = _to_float_tuple(src.get("end"), length=2)
+        return cls(
+            enabled=bool(src.get("enabled", False)),
+            color=_to_rgba(src.get("color"), fallback=(1.0, 0.78, 0.46, 1.0)),
+            strength=max(0.0, float(src.get("strength", 0.18))),
+            width=max(0.01, float(src.get("width", 0.22))),
+            softness=max(0.0, min(1.0, float(src.get("softness", 0.65)))),
+            start=(0.92, 0.94) if start is None else (float(start[0]), float(start[1])),
+            end=(0.40, 0.44) if end is None else (float(end[0]), float(end[1])),
+        )
+
+
+@dataclass
+class SSRConfig:
+    enabled: bool = False
+    refraction: bool = True
+    quality: float = 0.5
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "SSRConfig":
+        src = {} if data is None else dict(data)
+        _reject_unknown_keys(src, allowed={"enabled", "refraction", "quality"}, context="render.effects.ssr")
+        return cls(enabled=bool(src.get("enabled", False)), refraction=bool(src.get("refraction", True)), quality=float(src.get("quality", 0.5)))
+
+
+@dataclass
+class VignetteConfig:
+    enabled: bool = False
+    intensity: float = 0.12
+    softness: float = 0.45
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "VignetteConfig":
+        src = {} if data is None else dict(data)
+        _reject_unknown_keys(src, allowed={"enabled", "intensity", "softness"}, context="render.effects.vignette")
+        return cls(enabled=bool(src.get("enabled", False)), intensity=float(src.get("intensity", 0.12)), softness=float(src.get("softness", 0.45)))
+
+
+@dataclass
+class ChromaticAberrationConfig:
+    enabled: bool = False
+    dispersion: float = 0.015
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "ChromaticAberrationConfig":
+        src = {} if data is None else dict(data)
+        _reject_unknown_keys(src, allowed={"enabled", "dispersion"}, context="render.effects.chromatic_aberration")
+        return cls(enabled=bool(src.get("enabled", False)), dispersion=float(src.get("dispersion", 0.015)))
+
+
+@dataclass
+class FilmGrainConfig:
+    enabled: bool = False
+    strength: float = 0.025
+    scale: float = 85.0
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "FilmGrainConfig":
+        src = {} if data is None else dict(data)
+        _reject_unknown_keys(src, allowed={"enabled", "strength", "scale"}, context="render.effects.film_grain")
+        return cls(enabled=bool(src.get("enabled", False)), strength=float(src.get("strength", 0.025)), scale=float(src.get("scale", 85.0)))
+
+
+@dataclass
+class RenderEffectsConfig:
+    hdri: HDRIConfig = field(default_factory=HDRIConfig)
+    ambient_occlusion: AmbientOcclusionConfig = field(default_factory=AmbientOcclusionConfig)
+    bloom: BloomConfig = field(default_factory=BloomConfig)
+    atmosphere: AtmosphereConfig = field(default_factory=AtmosphereConfig)
+    volumetric_light: VolumetricLightConfig = field(default_factory=VolumetricLightConfig)
+    sunbeam: SunbeamConfig = field(default_factory=SunbeamConfig)
+    ssr: SSRConfig = field(default_factory=SSRConfig)
+    vignette: VignetteConfig = field(default_factory=VignetteConfig)
+    chromatic_aberration: ChromaticAberrationConfig = field(default_factory=ChromaticAberrationConfig)
+    film_grain: FilmGrainConfig = field(default_factory=FilmGrainConfig)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "RenderEffectsConfig":
+        src = {} if data is None else dict(data)
+        _reject_unknown_keys(
+            src,
+            allowed={
+                "hdri",
+                "ambient_occlusion",
+                "ao",
+                "bloom",
+                "atmosphere",
+                "volumetric_light",
+                "sunbeam",
+                "ssr",
+                "vignette",
+                "chromatic_aberration",
+                "film_grain",
+            },
+            context="render.effects",
+        )
+        return cls(
+            hdri=HDRIConfig.from_dict(_copy_dict(src.get("hdri"))),
+            ambient_occlusion=AmbientOcclusionConfig.from_dict(_copy_dict(src.get("ambient_occlusion", src.get("ao")))),
+            bloom=BloomConfig.from_dict(_copy_dict(src.get("bloom"))),
+            atmosphere=AtmosphereConfig.from_dict(_copy_dict(src.get("atmosphere"))),
+            volumetric_light=VolumetricLightConfig.from_dict(_copy_dict(src.get("volumetric_light"))),
+            sunbeam=SunbeamConfig.from_dict(_copy_dict(src.get("sunbeam"))),
+            ssr=SSRConfig.from_dict(_copy_dict(src.get("ssr"))),
+            vignette=VignetteConfig.from_dict(_copy_dict(src.get("vignette"))),
+            chromatic_aberration=ChromaticAberrationConfig.from_dict(_copy_dict(src.get("chromatic_aberration"))),
+            film_grain=FilmGrainConfig.from_dict(_copy_dict(src.get("film_grain"))),
+        )
 
 
 @dataclass
@@ -968,6 +1433,7 @@ class RenderSettings:
     transparent_bg: bool = True
     seed: int = 7
     color_management: dict[str, Any] = field(default_factory=dict)
+    effects: RenderEffectsConfig = field(default_factory=RenderEffectsConfig)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "RenderSettings":
@@ -982,6 +1448,7 @@ class RenderSettings:
                 "transparent_bg",
                 "seed",
                 "color_management",
+                "effects",
             },
             context="render",
         )
@@ -999,6 +1466,7 @@ class RenderSettings:
             transparent_bg=bool(src.get("transparent_bg", True)),
             seed=int(src.get("seed", 7)),
             color_management=_copy_dict(src.get("color_management")),
+            effects=RenderEffectsConfig.from_dict(_copy_dict(src.get("effects"))),
         )
 
 
@@ -1081,7 +1549,7 @@ class RenderJobConfig:
         return replace(self, output=replace(self.output, path=str(output_path), dir=None))
 
     def to_dict(self) -> dict[str, Any]:
-        data = asdict(self)
+        data = _jsonable_config(asdict(self))
         data["render"]["resolution"] = list(self.render.resolution)
         return data
 

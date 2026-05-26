@@ -4,7 +4,6 @@ from typing import Iterable
 
 import numpy as np
 
-from atomstudio.config import RenderJobConfig
 from atomstudio.preview.types import (
     AtomPreviewBuffer,
     BondPreviewBuffer,
@@ -18,6 +17,8 @@ from atomstudio.preview.types import (
     PreviewSelectionTarget,
     PreviewSettings,
 )
+from atomstudio.config import RenderJobConfig
+from atomstudio.scene.materials.specs import HandDrawnMaterialSpec, MaterialLike, MaterialSpec
 from atomstudio.scene.builder import build_render_scene
 from atomstudio.scene.model import RenderScene as SceneRenderScene
 from atomstudio.structure.structure import Structure
@@ -38,18 +39,41 @@ def preview_scene_from_render_scene(
     settings: PreviewSettings | None = None,
 ) -> PreviewScene:
     resolved_settings = PreviewSettings() if settings is None else settings
+    payload_cache: dict[tuple, PreviewMaterialPayload] = {}
 
-    atom_records = tuple(_atom_record(atom) for atom in scene.atoms)
-    atom_targets = tuple(_selection_target(atom.selection_payload, kind="atom", index=atom.index) for atom in scene.atoms)
+    atom_records = tuple(_atom_record(atom, payload_cache=payload_cache) for atom in scene.atoms)
+    atom_targets = tuple(
+        _selection_target(atom.selection_payload, kind="atom", index=atom.index) for atom in scene.atoms
+    )
 
-    atom_buffer = _build_atom_buffer(scene, show=bool(resolved_settings.show_atoms))
+    atom_buffer = _build_atom_buffer(
+        scene,
+        show=bool(resolved_settings.show_atoms),
+        payload_cache=payload_cache,
+    )
     visible_bonds = tuple(bond for bond in scene.bonds if bond.visible)
-    bond_records = tuple(_bond_record(bond) for bond in visible_bonds)
-    bond_targets = tuple(_selection_target(bond.selection_payload, kind="bond", index=bond.id) for bond in visible_bonds)
-    bond_buffer = _build_bond_buffer(visible_bonds, atom_lookup={atom.index: atom for atom in scene.atoms}, show=bool(resolved_settings.show_bonds))
+    bond_records = tuple(_bond_record(bond, payload_cache=payload_cache) for bond in visible_bonds)
+    bond_targets = tuple(
+        _selection_target(bond.selection_payload, kind="bond", index=bond.id) for bond in visible_bonds
+    )
+    atom_lookup = _first_atom_lookup(scene.atoms)
+    bond_buffer = _build_bond_buffer(
+        visible_bonds,
+        atom_lookup=atom_lookup,
+        show=bool(resolved_settings.show_bonds),
+        payload_cache=payload_cache,
+    )
 
-    cell_buffer = _build_cell_buffer(scene, show=bool(resolved_settings.show_cell))
-    polyhedra_buffer = _build_polyhedra_buffer(scene, show=bool(resolved_settings.show_polyhedra))
+    cell_buffer = _build_cell_buffer(
+        scene,
+        show=bool(resolved_settings.show_cell),
+        payload_cache=payload_cache,
+    )
+    polyhedra_buffer = _build_polyhedra_buffer(
+        scene,
+        show=bool(resolved_settings.show_polyhedra),
+        payload_cache=payload_cache,
+    )
 
     bounds = PreviewBounds(
         minimum=tuple(float(v) for v in scene.bounds.minimum),
@@ -102,11 +126,19 @@ def preview_scene_from_render_scene(
     )
 
 
-def _build_atom_buffer(scene: SceneRenderScene, *, show: bool) -> AtomPreviewBuffer:
+def _build_atom_buffer(
+    scene: SceneRenderScene,
+    *,
+    show: bool,
+    payload_cache: dict[tuple, PreviewMaterialPayload],
+) -> AtomPreviewBuffer:
     if not show or not scene.atoms:
         return AtomPreviewBuffer()
     positions = np.asarray([atom.position for atom in scene.atoms], dtype=np.float32).reshape((-1, 3))
-    colors = np.asarray([_payload(atom.material).color for atom in scene.atoms], dtype=np.float32).reshape((-1, 4))
+    colors = np.asarray(
+        [_payload(atom.material, payload_cache=payload_cache).color for atom in scene.atoms],
+        dtype=np.float32,
+    ).reshape((-1, 4))
     radii = np.asarray([atom.radius for atom in scene.atoms], dtype=np.float32)
     atom_indices = np.asarray([atom.index for atom in scene.atoms], dtype=np.int32)
     atomic_numbers = np.asarray([atom.atomic_number for atom in scene.atoms], dtype=np.int32)
@@ -121,11 +153,19 @@ def _build_atom_buffer(scene: SceneRenderScene, *, show: bool) -> AtomPreviewBuf
     )
 
 
+def _first_atom_lookup(atoms: Iterable[object]) -> dict[int, object]:
+    out: dict[int, object] = {}
+    for atom in atoms:
+        out.setdefault(int(getattr(atom, "index", -1)), atom)
+    return out
+
+
 def _build_bond_buffer(
     bonds: tuple,
     *,
     atom_lookup: dict[int, object],
     show: bool,
+    payload_cache: dict[tuple, PreviewMaterialPayload],
 ) -> BondPreviewBuffer:
     if not show or not bonds:
         return BondPreviewBuffer()
@@ -143,23 +183,51 @@ def _build_bond_buffer(
     for bond in bonds:
         atom_a = atom_lookup.get(int(bond.a))
         atom_b = atom_lookup.get(int(bond.b))
-        start = tuple(float(v) for v in getattr(atom_a, "position", (0.0, 0.0, 0.0)))
-        end = tuple(float(v) for v in getattr(atom_b, "position", (0.0, 0.0, 0.0)))
-        if bond.segments:
-            start = tuple(float(v) for v in bond.segments[0].start)
-            end = tuple(float(v) for v in bond.segments[-1].end)
-        uniform = _payload(bond.material_uniform or bond.material_left or bond.material_right)
-        left = _payload(bond.material_left or bond.material_uniform or bond.material_right)
-        right = _payload(bond.material_right or bond.material_uniform or bond.material_left)
-        positions.append((start, end))
-        colors.append((left.color, right.color))
-        bond_ids.append(int(bond.id))
-        atom_indices.append((int(bond.a), int(bond.b)))
-        radii.append(float(bond.radius))
-        orders.append(max(1, int(bond.order)))
-        split_ratios.append(float(bond.split_ratio))
-        split_mask.append(bool(left.color != right.color))
-        bond_types.append(str(bond.bond_type))
+        uniform = _payload(
+            bond.material_uniform or bond.material_left or bond.material_right,
+            payload_cache=payload_cache,
+        )
+        left = _payload(
+            bond.material_left or bond.material_uniform or bond.material_right,
+            payload_cache=payload_cache,
+        )
+        right = _payload(
+            bond.material_right or bond.material_uniform or bond.material_left,
+            payload_cache=payload_cache,
+        )
+        raw_segments = tuple(getattr(bond, "segments", ()) or ())
+        if raw_segments:
+            segment_items = tuple(
+                (
+                    tuple(float(v) for v in getattr(segment, "start")),
+                    tuple(float(v) for v in getattr(segment, "end")),
+                    float(getattr(segment, "radius", bond.radius)),
+                    getattr(segment, "material", None),
+                )
+                for segment in raw_segments
+            )
+        else:
+            start = tuple(float(v) for v in getattr(atom_a, "position", (0.0, 0.0, 0.0)))
+            end = tuple(float(v) for v in getattr(atom_b, "position", (0.0, 0.0, 0.0)))
+            segment_items = ((start, end, float(bond.radius), bond.material_uniform or bond.material_left or bond.material_right),)
+
+        if str(getattr(bond, "bond_type", "covalent")) == "hydrogen":
+            segment_items = _dashed_bond_segment_items(segment_items)
+
+        for start, end, radius, segment_material in segment_items:
+            material = _payload(
+                segment_material or bond.material_uniform or bond.material_left or bond.material_right,
+                payload_cache=payload_cache,
+            )
+            positions.append((start, end))
+            colors.append((material.color, material.color))
+            bond_ids.append(int(bond.id))
+            atom_indices.append((int(bond.a), int(bond.b)))
+            radii.append(float(radius))
+            orders.append(max(1, int(bond.order)))
+            split_ratios.append(float(bond.split_ratio))
+            split_mask.append(bool(left.color != right.color))
+            bond_types.append(str(bond.bond_type))
 
     connect = np.arange(len(positions) * 2, dtype=np.int32).reshape((-1, 2))
     return BondPreviewBuffer(
@@ -176,11 +244,44 @@ def _build_bond_buffer(
     )
 
 
-def _build_cell_buffer(scene: SceneRenderScene, *, show: bool) -> CellPreviewBuffer:
+def _dashed_bond_segment_items(segment_items: tuple) -> tuple:
+    dashed: list[tuple] = []
+    for start, end, radius, material in segment_items:
+        start_arr = np.asarray(start, dtype=float)
+        end_arr = np.asarray(end, dtype=float)
+        length = float(np.linalg.norm(end_arr - start_arr))
+        count = max(4, int(length / 0.18))
+        for idx in range(count):
+            t0 = idx / count
+            t1 = min(1.0, t0 + 0.58 / count)
+            dash_start = start_arr + (end_arr - start_arr) * t0
+            dash_end = start_arr + (end_arr - start_arr) * t1
+            dashed.append(
+                (
+                    tuple(float(v) for v in dash_start),
+                    tuple(float(v) for v in dash_end),
+                    float(radius),
+                    material,
+                )
+            )
+    return tuple(dashed)
+
+
+def _build_cell_buffer(
+    scene: SceneRenderScene,
+    *,
+    show: bool,
+    payload_cache: dict[tuple, PreviewMaterialPayload],
+) -> CellPreviewBuffer:
     if not show or not scene.cell_edges:
         return CellPreviewBuffer()
-    positions = np.asarray([(edge.start, edge.end) for edge in scene.cell_edges], dtype=np.float32).reshape((-1, 2, 3))
-    colors = np.asarray([_payload(edge.material).color for edge in scene.cell_edges], dtype=np.float32).reshape((-1, 4))
+    positions = np.asarray([(edge.start, edge.end) for edge in scene.cell_edges], dtype=np.float32).reshape(
+        (-1, 2, 3)
+    )
+    colors = np.asarray(
+        [_payload(edge.material, payload_cache=payload_cache).color for edge in scene.cell_edges],
+        dtype=np.float32,
+    ).reshape((-1, 4))
     radii = np.asarray([edge.radius for edge in scene.cell_edges], dtype=np.float32)
     connect = np.arange(len(scene.cell_edges) * 2, dtype=np.int32).reshape((-1, 2))
     edge_indices = np.asarray([(edge.index, edge.index) for edge in scene.cell_edges], dtype=np.int32).reshape((-1, 2))
@@ -193,7 +294,12 @@ def _build_cell_buffer(scene: SceneRenderScene, *, show: bool) -> CellPreviewBuf
     )
 
 
-def _build_polyhedra_buffer(scene: SceneRenderScene, *, show: bool) -> PolyhedraPreviewBuffer:
+def _build_polyhedra_buffer(
+    scene: SceneRenderScene,
+    *,
+    show: bool,
+    payload_cache: dict[tuple, PreviewMaterialPayload],
+) -> PolyhedraPreviewBuffer:
     if not show or not scene.polyhedra:
         return PolyhedraPreviewBuffer()
 
@@ -209,11 +315,11 @@ def _build_polyhedra_buffer(scene: SceneRenderScene, *, show: bool) -> Polyhedra
     vertex_atom_indices: list[int] = []
     vertex_offsets: list[int] = [0]
     face_offsets: list[int] = [0]
-    atom_lookup = {atom.index: atom for atom in scene.atoms}
+    atom_lookup = _first_atom_lookup(scene.atoms)
 
     for poly in scene.polyhedra:
-        material = _payload(poly.material)
-        edge_material = _payload(poly.edge_material or poly.material)
+        material = _payload(poly.material, payload_cache=payload_cache)
+        edge_material = _payload(poly.edge_material or poly.material, payload_cache=payload_cache)
         vertices.extend(tuple(tuple(float(v) for v in point) for point in poly.vertex_positions))
         face_base = vertex_offsets[-1]
         faces.extend((face[0] + face_base, face[1] + face_base, face[2] + face_base) for face in poly.faces)
@@ -247,7 +353,7 @@ def _build_polyhedra_buffer(scene: SceneRenderScene, *, show: bool) -> Polyhedra
     )
 
 
-def _atom_record(atom) -> PreviewAtomRecord:
+def _atom_record(atom, *, payload_cache: dict[tuple, PreviewMaterialPayload]) -> PreviewAtomRecord:
     return PreviewAtomRecord(
         index=int(atom.index),
         symbol=str(atom.symbol),
@@ -257,15 +363,24 @@ def _atom_record(atom) -> PreviewAtomRecord:
         representation=str(atom.representation),
         style=atom.style,
         tag=str(atom.tag),
-        material=_payload(atom.material),
+        material=_payload(atom.material, payload_cache=payload_cache),
         metadata=dict(atom.metadata),
     )
 
 
-def _bond_record(bond) -> PreviewBondRecord:
-    left = _payload(bond.material_left or bond.material_uniform or bond.material_right)
-    right = _payload(bond.material_right or bond.material_uniform or bond.material_left)
-    uniform = _payload(bond.material_uniform or bond.material_left or bond.material_right)
+def _bond_record(bond, *, payload_cache: dict[tuple, PreviewMaterialPayload]) -> PreviewBondRecord:
+    left = _payload(
+        bond.material_left or bond.material_uniform or bond.material_right,
+        payload_cache=payload_cache,
+    )
+    right = _payload(
+        bond.material_right or bond.material_uniform or bond.material_left,
+        payload_cache=payload_cache,
+    )
+    uniform = _payload(
+        bond.material_uniform or bond.material_left or bond.material_right,
+        payload_cache=payload_cache,
+    )
     metadata = dict(bond.metadata)
     metadata.setdefault("split_colors", bool(left.color != right.color))
     return PreviewBondRecord(
@@ -283,8 +398,60 @@ def _bond_record(bond) -> PreviewBondRecord:
     )
 
 
-def _payload(material) -> PreviewMaterialPayload:
-    return PreviewMaterialPayload.from_material_like(material)
+def _payload(
+    material: MaterialLike,
+    *,
+    payload_cache: dict[tuple, PreviewMaterialPayload] | None = None,
+) -> PreviewMaterialPayload:
+    if payload_cache is None:
+        return PreviewMaterialPayload.from_material_like(material)
+    key = _material_payload_key(material)
+    payload = payload_cache.get(key)
+    if payload is None:
+        payload = PreviewMaterialPayload.from_material_like(material)
+        payload_cache[key] = payload
+    return payload
+
+
+def _material_payload_key(material: MaterialLike) -> tuple:
+    if isinstance(material, HandDrawnMaterialSpec):
+        return (
+            "handdrawn",
+            tuple(float(v) for v in material.color),
+            float(material.alpha),
+            float(material.roughness),
+            float(material.specular),
+            float(material.jmol_desaturate),
+            float(material.jmol_lighten),
+            tuple(float(v) for v in material.light_direction),
+            float(material.shadow_area),
+            float(material.shadow_strength),
+            float(material.shadow_softness),
+            float(material.highlight_strength),
+            tuple(float(v) for v in material.highlight_direction),
+            float(material.highlight_arc_length),
+            float(material.highlight_band_inner),
+            float(material.highlight_band_outer),
+            float(material.outline_surface),
+            float(material.outline_molecule),
+            float(material.outline_bond),
+            float(material.outline_secondary_thickness),
+            tuple(float(v) for v in material.outline_secondary_color),
+        )
+    if isinstance(material, MaterialSpec):
+        return (
+            "principled",
+            tuple(float(v) for v in material.color),
+            float(material.alpha),
+            float(material.roughness),
+            float(material.specular),
+            float(material.metallic),
+            None if material.ior is None else float(material.ior),
+            float(material.coat),
+            float(material.coat_roughness),
+            float(material.specular_tint),
+        )
+    return ("object", id(material))
 
 
 def _selection_target(

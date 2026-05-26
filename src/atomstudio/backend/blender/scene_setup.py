@@ -7,11 +7,13 @@ from atomstudio.backend.blender.light_writer import BlenderLightWriter
 from atomstudio.backend.blender.material_adapter import scene_value
 from atomstudio.config import RenderJobConfig
 from atomstudio.scene.color_management import ColorManagementBuilder
+from atomstudio.scene.effects_builder import RenderEffectsBuilder
 from atomstudio.scene.ground_builder import GroundBuilder
 from atomstudio.scene.materials.registry import MaterialRegistry
 from atomstudio.scene.outline_builder import OutlineBuilder
 from atomstudio.scene.render_setup import RenderSetup
 from atomstudio.scene.style_helpers import resolve_handdrawn_config
+from atomstudio.scene.sunbeam_builder import SunbeamBuilder
 
 try:
     import bpy  # type: ignore
@@ -24,7 +26,9 @@ def apply_render_environment(cfg: RenderJobConfig, *, background: Any) -> None:
     ColorManagementBuilder.from_cfg(cfg).apply()
     from atomstudio.scene.world_builder import WorldBuilder
 
-    WorldBuilder.from_cfg(cfg, background=tuple(float(v) for v in background)).apply()
+    bg = tuple(float(v) for v in background)
+    WorldBuilder.from_cfg(cfg, background=bg).apply()
+    RenderEffectsBuilder.from_cfg(cfg, background=bg).apply()
 
 
 def apply_camera_lights_effects(
@@ -38,6 +42,7 @@ def apply_camera_lights_effects(
     BlenderCameraWriter(cfg).write(scene, points)
     BlenderLightWriter(cfg, default_light_style=style_bundle.light_style_name).write(scene, points)
     _, ground_spec = GroundBuilder.from_cfg(cfg, registry=registry).build(points)
+    SunbeamBuilder.from_cfg(cfg).apply(points)
 
     handdrawn = resolve_handdrawn_config(
         style_bundle.material_style.pipeline,

@@ -9,7 +9,7 @@ from atomstudio.backend.blender.material_adapter import scene_value
 from atomstudio.backend.blender.scene_setup import apply_camera_lights_effects, apply_render_environment, write_scene_metadata
 from atomstudio.backend.blender.scene_writer import BlenderSceneWriter
 from atomstudio.config import RenderJobConfig
-from atomstudio.scene.builder import build_render_scene
+from atomstudio.scene.builder import bake_preview_model_transform, build_render_scene
 from atomstudio.scene.materials.registry import MaterialRegistry
 from atomstudio.structure.structure import Structure
 from atomstudio.style.registry import get_scene_style
@@ -26,6 +26,8 @@ def _jsonable(value: Any) -> Any:
         return {str(k): _jsonable(v) for k, v in dataclasses.asdict(value).items()}
     if isinstance(value, dict):
         return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, set):
+        return sorted(_jsonable(v) for v in value)
     if isinstance(value, (list, tuple)):
         return [_jsonable(v) for v in value]
     if hasattr(value, "to_dict"):
@@ -40,7 +42,7 @@ def _jsonable(value: Any) -> Any:
 
 
 def build_render_scene_payload(structure: Structure, cfg: RenderJobConfig) -> dict[str, Any]:
-    scene = build_render_scene(structure, cfg)
+    scene = bake_preview_model_transform(build_render_scene(structure, cfg))
     return {
         "schema": "atomstudio.render_scene.v1",
         "source": "scene_builder",

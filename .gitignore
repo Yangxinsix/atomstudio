@@ -1,0 +1,26 @@
+# Tests
+tests/**
+
+# Python bytecode and caches
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Build, packaging, and install artifacts
+/build/
+/dist/
+*.egg-info/
+.eggs/
+*.egg
+pip-wheel-metadata/
+
+# Local virtual environments
+.venv/
+venv/
+env/

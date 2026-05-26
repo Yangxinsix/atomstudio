@@ -1,0 +1,77 @@
+version: 2
+jobs:
+  - id: pt_water_studio_highkey_darkbg_sunbeam_4096
+    input:
+      path: /home/xinyang/pt_water.cif
+      frames: last
+    output:
+      path: /home/xinyang/work/atomstudio/output/pt_water_studio_highkey_darkbg_sunbeam_4096.png
+    style:
+      scene_style: studio_highkey
+      background: [0.105, 0.125, 0.145, 1.0]
+      atom_styles:
+        H_custom: {radius: 0.24}
+        O_custom: {radius: 0.42}
+        Pt_custom: {radius: 1.20}
+      atom_style_rules:
+        - selector: {symbol: H}
+          style: H_custom
+        - selector: {symbol: O}
+          style: O_custom
+        - selector: {symbol: Pt}
+          style: Pt_custom
+    structure:
+      draw_cell: false
+      cell_style: {show: false}
+      model_view: "-82.4x,-9.6y,-1.0z"
+      bonding:
+        hbond: {enabled: false}
+    camera:
+      view: top
+      frame_scale: 1.06
+    lighting:
+      ground:
+        enabled: false
+      sweep:
+        enabled: true
+        width_scale: 9.0
+        floor_depth_scale: 7.0
+        wall_height_scale: 8.0
+        radius_scale: 1.6
+        floor_offset_scale: 0.020
+        wall_offset_scale: 0.35
+        segments: 40
+        color: [0.095, 0.115, 0.135, 1.0]
+        roughness: 0.68
+        specular: 0.06
+        coat: 0.02
+        coat_roughness: 0.42
+        gradient_enabled: true
+        bottom_color: [0.070, 0.085, 0.105, 1.0]
+        top_color: [0.145, 0.170, 0.195, 1.0]
+        spot_color: [0.95, 0.74, 0.42, 1.0]
+        spot_strength: 0.58
+        spot_x: 0.84
+        spot_y: 0.88
+        spot_radius: 0.38
+        vignette_strength: 0.24
+    render:
+      engine: cycles
+      device: auto
+      samples: 128
+      resolution: [4096, 4096]
+      transparent_bg: false
+      color_management:
+        view_transform: Standard
+        look: Medium High Contrast
+        exposure: 0.02
+        gamma: 1.0
+      effects:
+        sunbeam:
+          enabled: true
+          color: [1.0, 0.78, 0.44, 1.0]
+          strength: 0.36
+          width: 0.115
+          softness: 0.78
+          start: [1.12, 1.15]
+          end: [0.56, 0.28]

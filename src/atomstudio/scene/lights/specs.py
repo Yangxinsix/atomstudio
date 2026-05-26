@@ -27,6 +27,8 @@ class LightSpec:
     vector: tuple[float, float, float] = (0.0, 0.0, 0.0)
     energy: float = 100.0
     size: float = 1.0
+    size_y: float | None = None
+    shape: str | None = None
     color: tuple[float, float, float, float] | None = None
     lock_to_camera: bool = False
 
@@ -63,6 +65,8 @@ class LightSpec:
             vector=vector,
             energy=float(src.get("energy", 100.0)),
             size=float(src.get("size", 1.0)),
+            size_y=float(src["size_y"]) if src.get("size_y") is not None else None,
+            shape=str(src["shape"]).upper() if src.get("shape") is not None else None,
             color=color,
             lock_to_camera=bool(src.get("lock_to_camera", False)),
         )
@@ -89,6 +93,13 @@ class LightSpec:
             return max(0.1, float(self.size) * float(extent))
         return float(self.size)
 
+    def resolve_size_y(self, extent: float) -> float | None:
+        if self.size_y is None:
+            return None
+        if self.placement == "scaled_offset":
+            return max(0.1, float(self.size_y) * float(extent))
+        return float(self.size_y)
+
     def to_runtime_spec(
         self,
         center: tuple[float, float, float],
@@ -100,6 +111,8 @@ class LightSpec:
             "location": self.resolve_location(center, extent),
             "energy": float(self.energy) * float(intensity),
             "size": self.resolve_size(extent),
+            "size_y": self.resolve_size_y(extent),
+            "shape": None if self.shape is None else str(self.shape).upper(),
             "color": self.color,
             "lock_to_camera": bool(self.lock_to_camera),
         }

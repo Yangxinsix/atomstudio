@@ -31,6 +31,8 @@ def resolve_scene_lights(
                 location=location,
                 energy=float(spec["energy"]),
                 size=float(spec["size"]),
+                size_y=None if spec.get("size_y") is None else float(spec["size_y"]),
+                shape=None if spec.get("shape") is None else str(spec["shape"]),
                 color=None if spec.get("color") is None else tuple(float(v) for v in spec["color"]),
                 direction=direction,
                 lock_to_camera=bool(spec.get("lock_to_camera", False)),

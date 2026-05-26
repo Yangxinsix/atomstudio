@@ -1,0 +1,20 @@
+{
+  "job_id": "pt_water_studio_highkey_darkbg_sunbeam_4096",
+  "success": true,
+  "outputs": [
+    "/home/xinyang/work/atomstudio/output/pt_water_studio_highkey_darkbg_sunbeam_4096.png"
+  ],
+  "failed_frames": [],
+  "elapsed_seconds": 52.60046335600782,
+  "message": "ok",
+  "frame_reports": [
+    {
+      "success": true,
+      "output_path": "/home/xinyang/work/atomstudio/output/pt_water_studio_highkey_darkbg_sunbeam_4096.png",
+      "frame_index": 0,
+      "message": "ok",
+      "elapsed_seconds": 50.95094144297764,
+      "adjustments": {}
+    }
+  ]
+}

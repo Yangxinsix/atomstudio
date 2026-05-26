@@ -13,6 +13,68 @@ except Exception:  # pragma: no cover
     QtWidgets = None
 
 
+def wheel_steps_from_event(event: Any) -> float | None:
+    delta = getattr(event, "delta", None)
+    if delta is not None:
+        if callable(delta):
+            try:
+                raw_delta = delta()
+            except TypeError:
+                raw_delta = None
+            steps = _delta_y(raw_delta)
+        else:
+            steps = _delta_y(delta)
+        if steps is not None:
+            return _normalize_wheel_steps(steps)
+
+    angle_delta = _event_point_y(event, "angleDelta")
+    if angle_delta is not None and abs(angle_delta) > 0.0:
+        return angle_delta / 120.0
+
+    pixel_delta = _event_point_y(event, "pixelDelta")
+    if pixel_delta is not None and abs(pixel_delta) > 0.0:
+        return pixel_delta / 120.0
+    return None
+
+
+def _event_point_y(event: Any, method_name: str) -> float | None:
+    method = getattr(event, method_name, None)
+    if not callable(method):
+        return None
+    try:
+        return _delta_y(method())
+    except Exception:
+        return None
+
+
+def _delta_y(value: Any) -> float | None:
+    if value is None:
+        return None
+    y = getattr(value, "y", None)
+    if callable(y):
+        try:
+            return float(y())
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(value, (str, bytes)):
+        try:
+            if len(value) > 1:
+                return float(value[1])
+            if len(value) == 1:
+                return float(value[0])
+        except (IndexError, TypeError, ValueError):
+            pass
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_wheel_steps(value: float) -> float:
+    steps = float(value)
+    return steps / 120.0 if abs(steps) > 24.0 else steps
+
+
 class PreviewMouseToolController(QtCore.QObject if QtCore is not None else object):
     """Own mouse tool state and dispatch; PreviewCanvas owns rendering only."""
 
@@ -25,22 +87,27 @@ class PreviewMouseToolController(QtCore.QObject if QtCore is not None else objec
         self._drag_start: tuple[float, float] | None = None
         self._drag_last: tuple[float, float] | None = None
         self._middle_pan_active = False
+        self._right_zoom_active = False
         self._last_press: tuple[float, tuple[float, float]] | None = None
         self._measurement = MeasurementController()
         self._rubber_band = None
 
     def install(self) -> None:
-        self.canvas.set_camera_mouse_enabled(True)
+        self.canvas.set_camera_mouse_enabled(False)
 
-    def set_mode(self, mode: str) -> str:
-        self.mode = normalize_mouse_mode(mode)
+    def cancel_interaction(self) -> None:
         self._drag_start = None
         self._drag_last = None
         self._middle_pan_active = False
+        self._right_zoom_active = False
         self._last_press = None
         self._measurement.clear()
         self._hide_selection_rect()
-        self.canvas.set_camera_mouse_enabled(self.mode == "rotate")
+
+    def set_mode(self, mode: str) -> str:
+        self.mode = normalize_mouse_mode(mode)
+        self.cancel_interaction()
+        self.canvas.set_camera_mouse_enabled(False)
         self.canvas.emit_interaction_message(f"Mouse mode: {self.mode.replace('_', ' ')}")
         return self.mode
 
@@ -54,6 +121,16 @@ class PreviewMouseToolController(QtCore.QObject if QtCore is not None else objec
             self._drag_start = point
             self._drag_last = point
             self._middle_pan_active = True
+            return
+        if self._is_right_button(event):
+            pos = getattr(event, "pos", None)
+            if pos is None:
+                return
+            self._mark_event_handled(event)
+            point = (float(pos[0]), float(pos[1]))
+            self._drag_start = point
+            self._drag_last = point
+            self._right_zoom_active = True
             return
         if not self._is_left_button(event):
             return
@@ -70,6 +147,9 @@ class PreviewMouseToolController(QtCore.QObject if QtCore is not None else objec
                     clear_on_miss=False,
                 )
             self._last_press = (time.monotonic(), point)
+            self._mark_event_handled(event)
+            self._drag_start = point
+            self._drag_last = point
             return
         self._mark_event_handled(event)
         if self.mode == "select":
@@ -104,6 +184,9 @@ class PreviewMouseToolController(QtCore.QObject if QtCore is not None else objec
         )
 
     def handle_move(self, event: Any) -> None:
+        if self._right_zoom_active and self._drag_last is not None:
+            self._handle_zoom_drag(event)
+            return
         if self._middle_pan_active and self._drag_last is not None:
             self._handle_pan_drag(event)
             return
@@ -116,16 +199,38 @@ class PreviewMouseToolController(QtCore.QObject if QtCore is not None else objec
             self._drag_last = point
             self._show_selection_rect(self._drag_start, point)
             return
+        if self.mode == "rotate" and self._drag_last is not None:
+            pos = getattr(event, "pos", None)
+            if pos is None:
+                return
+            self._mark_event_handled(event)
+            point = (float(pos[0]), float(pos[1]))
+            rotate = getattr(self.canvas, "rotate_model_drag", None)
+            if callable(rotate):
+                rotate(self._drag_last, point)
+            self._drag_last = point
+            return
         if self.mode != "pan" or self._drag_last is None:
             return
         self._handle_pan_drag(event)
 
     def handle_release(self, event: Any) -> None:
+        if self._right_zoom_active:
+            self._mark_event_handled(event)
+            self._drag_start = None
+            self._drag_last = None
+            self._right_zoom_active = False
+            return
         if self._middle_pan_active:
             self._mark_event_handled(event)
             self._drag_start = None
             self._drag_last = None
             self._middle_pan_active = False
+            return
+        if self.mode == "rotate":
+            self._mark_event_handled(event)
+            self._drag_start = None
+            self._drag_last = None
             return
         if self.mode == "pan":
             self._mark_event_handled(event)
@@ -151,6 +256,28 @@ class PreviewMouseToolController(QtCore.QObject if QtCore is not None else objec
         self._hide_selection_rect()
         self._drag_start = None
         self._drag_last = None
+
+    def handle_wheel(self, event: Any) -> None:
+        zoom = getattr(self.canvas, "zoom_view", None)
+        if not callable(zoom):
+            return
+        steps = wheel_steps_from_event(event)
+        if steps is None or abs(steps) <= 0.0:
+            return
+        self._mark_event_handled(event)
+        zoom(1.12**steps)
+
+    def _handle_zoom_drag(self, event: Any) -> None:
+        pos = getattr(event, "pos", None)
+        zoom = getattr(self.canvas, "zoom_view", None)
+        if pos is None or self._drag_last is None or not callable(zoom):
+            return
+        self._mark_event_handled(event)
+        point = (float(pos[0]), float(pos[1]))
+        dy = float(self._drag_last[1] - point[1])
+        if abs(dy) > 0.0:
+            zoom(1.01**dy)
+        self._drag_last = point
 
     def _handle_pan_drag(self, event: Any) -> None:
         pos = getattr(event, "pos", None)
@@ -203,7 +330,13 @@ class PreviewMouseToolController(QtCore.QObject if QtCore is not None else objec
         try:
             event.handled = True
         except Exception:
-            return
+            pass
+        accept = getattr(event, "accept", None)
+        if callable(accept):
+            try:
+                accept()
+            except Exception:
+                pass
 
     @staticmethod
     def _is_left_button(event: Any) -> bool:
@@ -217,7 +350,26 @@ class PreviewMouseToolController(QtCore.QObject if QtCore is not None else objec
         button = getattr(event, "button", None)
         if callable(button):
             button = button()
+        if QtCore is not None and hasattr(QtCore.Qt, "MouseButton"):
+            try:
+                if button == QtCore.Qt.MouseButton.MiddleButton:
+                    return True
+            except Exception:
+                pass
         return button in {3, 4, "middle", "MiddleButton"}
+
+    @staticmethod
+    def _is_right_button(event: Any) -> bool:
+        button = getattr(event, "button", None)
+        if callable(button):
+            button = button()
+        if QtCore is not None and hasattr(QtCore.Qt, "MouseButton"):
+            try:
+                if button == QtCore.Qt.MouseButton.RightButton:
+                    return True
+            except Exception:
+                pass
+        return button in {2, "right", "RightButton"}
 
     @staticmethod
     def _event_has_ctrl(event: Any) -> bool:
@@ -233,4 +385,4 @@ class PreviewMouseToolController(QtCore.QObject if QtCore is not None else objec
             return False
 
 
-__all__ = ["PreviewMouseToolController"]
+__all__ = ["PreviewMouseToolController", "wheel_steps_from_event"]

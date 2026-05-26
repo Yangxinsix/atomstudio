@@ -53,8 +53,9 @@ class HitTestCache:
             return cls()
         hits = []
         radius_floor = max(1.0, float(picking_radius_px))
+        scene_radius = max(1.0, float(getattr(scene, "radius", 1.0) or 1.0))
         for atom in scene.atoms:
-            x, y, depth = project_point(atom.position, camera, viewport_size)
+            x, y, depth = project_point(atom.position, camera, viewport_size, scene_radius=scene_radius)
             hits.append(
                 AtomHit(
                     index=int(atom.index),
@@ -183,7 +184,9 @@ class MeasurementController:
         return complete, list(self.atom_indices[:required])
 
     def message(self, scene: PreviewRenderScene | None, atom_indices: list[int]) -> str:
-        positions = {int(atom.index): np.asarray(atom.position, dtype=float) for atom in (scene.atoms if scene else ())}
+        positions: dict[int, np.ndarray] = {}
+        for atom in scene.atoms if scene else ():
+            positions.setdefault(int(atom.index), np.asarray(atom.position, dtype=float))
         points = [positions[index] for index in atom_indices if index in positions]
         if len(points) == 2:
             distance = float(np.linalg.norm(points[1] - points[0]))

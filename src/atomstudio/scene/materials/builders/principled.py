@@ -4,6 +4,13 @@ from atomstudio.scene.materials.builders.base import MaterialBuildContext
 from atomstudio.scene.materials.specs import MaterialLike, as_material_spec
 
 
+def _set_float_input(node, names: tuple[str, ...], value: float) -> None:
+    for name in names:
+        if name in node.inputs:
+            node.inputs[name].default_value = float(value)
+            return
+
+
 class PrincipledMaterialBuilder:
     def build(self, mat, material: MaterialLike, *, context: MaterialBuildContext) -> None:
         spec = as_material_spec(material)
@@ -26,6 +33,16 @@ class PrincipledMaterialBuilder:
             bsdf.inputs["Specular IOR Level"].default_value = float(spec.specular)
         elif "Specular" in bsdf.inputs:
             bsdf.inputs["Specular"].default_value = float(spec.specular)
+        _set_float_input(bsdf, ("Transmission Weight", "Transmission"), float(spec.transmission))
+        _set_float_input(bsdf, ("Sheen Weight", "Sheen"), float(spec.sheen))
+        _set_float_input(bsdf, ("Subsurface Weight", "Subsurface"), float(spec.subsurface))
+        if float(spec.emission_strength) > 0.0:
+            emission_color = spec.color if spec.emission_color is None else spec.emission_color
+            if "Emission Color" in bsdf.inputs:
+                bsdf.inputs["Emission Color"].default_value = emission_color
+            elif "Emission" in bsdf.inputs:
+                bsdf.inputs["Emission"].default_value = emission_color
+            _set_float_input(bsdf, ("Emission Strength",), float(spec.emission_strength))
         if "Specular Tint" in bsdf.inputs:
             try:
                 bsdf.inputs["Specular Tint"].default_value = float(spec.specular_tint)
@@ -46,6 +63,8 @@ class PrincipledMaterialBuilder:
             mat.blend_method = "BLEND"
             if hasattr(mat, "shadow_method"):
                 mat.shadow_method = "HASHED"
+            if hasattr(mat, "use_screen_refraction"):
+                mat.use_screen_refraction = True
         else:
             mat.blend_method = "OPAQUE"
 

@@ -67,7 +67,7 @@ def apply_scene_style_defaults_to_job_payload(job: dict[str, Any]) -> dict[str, 
     structure_dict = structure if isinstance(structure, dict) else {}
     if "bond_cutoff_scale" in structure_dict:
         raise ConfigError(
-            "structure.bond_cutoff_scale has been removed. Use structure.bonding.cutoff_scale."
+            "structure.bond_cutoff_scale has been removed. Use structure.bonding.pair_distances."
         )
     camera = src.get("camera")
     camera_dict = camera if isinstance(camera, dict) else {}
@@ -85,6 +85,7 @@ def apply_scene_style_defaults_to_job_payload(job: dict[str, Any]) -> dict[str, 
 
     _deep_fill_missing(structure_dict, scene_style.structure_tokens)
     _deep_fill_missing(camera_dict, scene_style.camera_tokens)
+    _deep_fill_missing(lighting_dict, scene_style.lighting_tokens)
     _deep_fill_missing(lighting_dict, {"intensity": 1.0})
     _deep_fill_missing(render_dict, scene_style.render_tokens)
 

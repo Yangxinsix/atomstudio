@@ -41,6 +41,11 @@ class BlenderLightWriter:
             obj.data.energy = float(runtime.get("energy", 100.0))
             if str(runtime.get("type", "AREA")).upper() == "AREA":
                 obj.data.size = float(runtime.get("size", 1.0))
+                shape = runtime.get("shape")
+                if shape is not None and hasattr(obj.data, "shape"):
+                    obj.data.shape = str(shape).upper()
+                if runtime.get("size_y") is not None and hasattr(obj.data, "size_y"):
+                    obj.data.size_y = float(runtime.get("size_y"))
             if str(runtime.get("type", "")).upper() == "SUN" and hasattr(obj.data, "angle"):
                 obj.data.angle = radians(max(0.1, min(10.0, float(runtime.get("size", 1.0)))))
             color = runtime.get("color")

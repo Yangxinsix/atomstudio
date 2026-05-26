@@ -6,18 +6,6 @@ import sys
 from dataclasses import asdict, replace
 from pathlib import Path
 
-from atomstudio.io.ase_loader import load_structure, load_trajectory
-from atomstudio.render.config_resolver import (
-    load_batch_config,
-    validate_config_file,
-)
-from atomstudio.render.cli_like import (
-    CLI_RENDER_KWARG_DEFAULTS,
-    RENDER_QUALITY_PRESETS,
-    build_render_job_config_from_cli_like_kwargs,
-)
-from atomstudio.render.pipeline import render_batch, render_single_from_config, render_structure
-from atomstudio.scene.lights.builder import resolve_lighting_specs
 from atomstudio.style.registry import (
     color_style_choices,
     light_style_choices,
@@ -25,8 +13,13 @@ from atomstudio.style.registry import (
     radius_style_choices,
     scene_style_choices,
 )
-from atomstudio.style.resolver import resolve_style_bundle
-from atomstudio.config import RenderJobConfig
+
+_SCENE_STYLE_CHOICES = tuple(scene_style_choices())
+_COLOR_STYLE_CHOICES = tuple(color_style_choices())
+_MATERIAL_STYLE_CHOICES = tuple(material_style_choices())
+_LIGHT_STYLE_CHOICES = tuple(light_style_choices())
+_RADIUS_STYLE_CHOICES = tuple(radius_style_choices())
+_QUALITY_CHOICES = ("high", "low", "medium", "very_high")
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -41,12 +34,12 @@ def _build_parser() -> argparse.ArgumentParser:
     render.add_argument("--out", default=None, help="Output PNG path for single frame")
     render.add_argument("--out-dir", default=None, help="Output directory for frame sequence")
     render.add_argument("--filename-template", default="frame_{frame:04d}.png", help="Template for sequence")
-    render.add_argument("--style", default="default", choices=scene_style_choices())
-    render.add_argument("--color-style", default=None, choices=color_style_choices())
-    render.add_argument("--material-style", default=None, choices=material_style_choices())
-    render.add_argument("--light-style", default=None, choices=light_style_choices())
-    render.add_argument("--radius-style", default=None, choices=radius_style_choices())
-    render.add_argument("--quality", default=None, choices=sorted(RENDER_QUALITY_PRESETS.keys()))
+    render.add_argument("--style", default="default", choices=_SCENE_STYLE_CHOICES)
+    render.add_argument("--color-style", default=None, choices=_COLOR_STYLE_CHOICES)
+    render.add_argument("--material-style", default=None, choices=_MATERIAL_STYLE_CHOICES)
+    render.add_argument("--light-style", default=None, choices=_LIGHT_STYLE_CHOICES)
+    render.add_argument("--radius-style", default=None, choices=_RADIUS_STYLE_CHOICES)
+    render.add_argument("--quality", default=None, choices=_QUALITY_CHOICES)
     render.add_argument("--light-intensity", default=1.0, type=float)
     render.add_argument("--representation", default="auto", choices=["auto", "space_filling", "ball_stick"])
     render.add_argument("--engine", default="cycles", choices=["cycles", "eevee", "BLENDER_EEVEE", "BLENDER_EEVEE_NEXT", "CYCLES"])
@@ -102,12 +95,20 @@ def _build_parser() -> argparse.ArgumentParser:
     app = sub.add_parser("app", help="Launch the desktop OpenGL preview app")
     app.add_argument("--config", default=None, help="Optional v2 YAML/JSON config path")
     app.add_argument("--input", default=None, help="Optional input structure/trajectory path")
-    app.add_argument("--frame", default="last", help="Initial frame selector, e.g. last or 0")
+    app.add_argument("--frame", default="all", help="Initial frame selector, e.g. all, last, 0, or 0:100:1")
+    app.add_argument(
+        "--preview-backend",
+        default="opengl",
+        choices=["vispy", "opengl", "opengl-window", "opengl-widget", "opengl-detached"],
+        help="Preview widget backend to use in the desktop app",
+    )
 
     return parser
 
 
 def _job_from_flags(args: argparse.Namespace, output_path: str) -> RenderJobConfig:
+    from atomstudio.render.cli_like import CLI_RENDER_KWARG_DEFAULTS, build_render_job_config_from_cli_like_kwargs
+
     cli_kwargs = {}
     for key, default in CLI_RENDER_KWARG_DEFAULTS.items():
         if not hasattr(args, key):
@@ -141,6 +142,9 @@ def _build_debug_payload(
     symbols: list[str] | None = None,
     positions: list[tuple[float, float, float]] | None = None,
 ) -> dict:
+    from atomstudio.scene.lights.builder import resolve_lighting_specs
+    from atomstudio.style.resolver import resolve_style_bundle
+
     payload = {"debug_config": cfg.to_dict()}
     try:
         style_bundle = resolve_style_bundle(cfg.style)
@@ -179,6 +183,10 @@ def _build_debug_payload(
 
 
 def _cmd_render(args: argparse.Namespace) -> int:
+    from atomstudio.io.ase_loader import load_structure, load_trajectory
+    from atomstudio.render.config_resolver import load_batch_config
+    from atomstudio.render.pipeline import render_single_from_config, render_structure
+
     if args.config:
         if bool(getattr(args, "debug_config", False)):
             batch = load_batch_config(args.config)
@@ -228,6 +236,8 @@ def _cmd_render(args: argparse.Namespace) -> int:
 
 
 def _cmd_batch(args: argparse.Namespace) -> int:
+    from atomstudio.render.pipeline import render_batch
+
     result = render_batch(args.config)
     payload = {"success": result.success, "reports": [asdict(r) for r in result.reports]}
     print(json.dumps(payload, indent=2))
@@ -235,6 +245,8 @@ def _cmd_batch(args: argparse.Namespace) -> int:
 
 
 def _cmd_validate(args: argparse.Namespace) -> int:
+    from atomstudio.render.config_resolver import validate_config_file
+
     cfg = validate_config_file(args.config)
     print(json.dumps({"success": True, "version": cfg["version"], "jobs": len(cfg["jobs"])}, indent=2))
     return 0
@@ -251,13 +263,13 @@ def _cmd_app(args: argparse.Namespace) -> int:
             ) from exc
         raise
 
-    return int(
-        run_app(
-            input_path=args.input,
-            config_path=args.config,
-            frame=args.frame,
-        )
-    )
+    kwargs = {
+        "input_path": args.input,
+        "config_path": args.config,
+        "frame": args.frame,
+        "preview_backend": args.preview_backend,
+    }
+    return int(run_app(**kwargs))
 
 
 def main(argv: list[str] | None = None) -> int:

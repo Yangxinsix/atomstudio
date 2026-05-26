@@ -16,7 +16,14 @@ from atomstudio.preview.mesh_builder import (
     polyhedron_edge_segments,
     triangulate_polyhedron,
 )
-from atomstudio.preview.picking import pick_bond_selection, project_atom_positions, rotation_basis
+from atomstudio.preview.picking import (
+    atom_indices_in_rect,
+    bond_indices_in_rect,
+    pick_bond_selection,
+    pick_selection,
+    project_atom_positions,
+    rotation_basis,
+)
 from atomstudio.preview.selection import cycle_atom_selection, cycle_bond_selection, selection_payload
 from atomstudio.preview.types import (
     PreviewAtomRecord,
@@ -37,7 +44,7 @@ from atomstudio.structure.structure import Structure
 @dataclass(frozen=True)
 class PreviewSettings:
     background: tuple[float, float, float, float] = (1.0, 1.0, 1.0, 1.0)
-    default_view: str = "orbit"
+    default_view: str = "top"
     fit_padding: float = 0.14
     atom_scale: float = 34.0
     selected_atom_scale: float = 1.04
@@ -56,13 +63,32 @@ class PreviewSettings:
 class PreviewCameraState:
     center: tuple[float, float, float] = (0.0, 0.0, 0.0)
     scale_factor: float = 1.0
-    view: str = "orbit"
-    azimuth: float = 45.0
-    elevation: float = 30.0
+    view: str = "top"
+    azimuth: float = 0.0
+    elevation: float = 90.0
     roll: float = 0.0
     right: tuple[float, float, float] = (1.0, 0.0, 0.0)
     up: tuple[float, float, float] = (0.0, 1.0, 0.0)
     forward: tuple[float, float, float] = (0.0, 0.0, -1.0)
+    model_translation: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    model_rotation: tuple[float, ...] = (
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+    )
 
     def basis(self) -> tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]:
         return self.right, self.up, self.forward
@@ -104,6 +130,20 @@ def _buffer_bounds(scene: PreviewScene) -> tuple[tuple[float, float, float], tup
         tuple(float(v) for v in np.asarray(scene.center, dtype=float)),
         max(1.0, float(scene.extent)),
     )
+
+
+def _scene_source(scene: PreviewRenderScene | PreviewScene | None) -> str:
+    if scene is None:
+        return ""
+    source = getattr(scene, "source_path", "")
+    if source:
+        return str(source)
+    report = getattr(scene, "report", None)
+    if isinstance(report, dict):
+        source = report.get("source_path")
+        if source:
+            return str(source)
+    return ""
 
 
 def _split_segment(
@@ -166,7 +206,12 @@ def render_scene_from_preview_scene(scene: PreviewScene, settings: PreviewSettin
     for idx in range(scene.atoms.count):
         atom_index = int(atom_indices[idx]) if idx < atom_indices.shape[0] else idx
         radius = float(atom_radii[idx]) if idx < atom_radii.shape[0] else 0.2
-        record = atom_record_map.get(atom_index)
+        ordinal_record = atom_records[idx] if idx < len(atom_records) else None
+        record = (
+            ordinal_record
+            if ordinal_record is not None and int(ordinal_record.index) == atom_index
+            else atom_record_map.get(atom_index)
+        )
         material = preview_material_payload(record.material) if record is not None else None
         color = tuple(float(v) for v in atom_colors[idx]) if idx < atom_colors.shape[0] else (
             tuple(float(v) for v in material.color) if material is not None else (0.7, 0.7, 0.7, 1.0)
@@ -177,7 +222,9 @@ def render_scene_from_preview_scene(scene: PreviewScene, settings: PreviewSettin
                 symbol=scene.atoms.symbols[idx] if idx < len(scene.atoms.symbols) else "X",
                 position=tuple(float(v) for v in atom_positions[idx]),
                 radius=radius,
-                representation=scene.atoms.representations[idx] if idx < len(scene.atoms.representations) else scene.representation,
+                representation=(
+                    scene.atoms.representations[idx] if idx < len(scene.atoms.representations) else scene.representation
+                ),
                 color=color,
                 size_px=max(4.0, radius * settings.atom_scale),
                 material=material,
@@ -195,27 +242,42 @@ def render_scene_from_preview_scene(scene: PreviewScene, settings: PreviewSettin
     bond_ids = np.asarray(scene.bonds.bond_ids, dtype=np.int32)
     bond_records = tuple(getattr(scene, "bond_records", ()) or ())
     bond_record_map = {int(record.id): record for record in bond_records}
+    bond_groups: dict[int, list[int]] = {}
     for idx in range(scene.bonds.segment_count):
+        bond_index = int(bond_ids[idx]) if idx < bond_ids.shape[0] else idx
+        bond_groups.setdefault(bond_index, []).append(idx)
+    for bond_index, indexes in bond_groups.items():
+        idx = indexes[0]
         start = bond_positions[idx, 0]
         end = bond_positions[idx, 1]
         left_color = tuple(float(v) for v in bond_colors[idx, 0])
         right_color = tuple(float(v) for v in bond_colors[idx, 1])
         width_px = max(1.0, float(bond_radii[idx]) * settings.bond_scale)
         order = max(1, int(bond_orders[idx]) if idx < bond_orders.shape[0] else 1)
-        bond_index = int(bond_ids[idx]) if idx < bond_ids.shape[0] else idx
         atom_a = int(bond_atom_indices[idx, 0]) if idx < bond_atom_indices.shape[0] else 0
         atom_b = int(bond_atom_indices[idx, 1]) if idx < bond_atom_indices.shape[0] else 0
         record = bond_record_map.get(bond_index)
-        segments = build_bond_segments(
-            start,
-            end,
-            left_color,
-            right_color,
-            width_px=width_px,
-            order=order,
-            split=bool(record is not None and record.material_left is not None and record.material_right is not None and order == 1),
-            split_ratio=float(split_ratios[idx]) if idx < split_ratios.shape[0] else 0.5,
-        )
+        if len(indexes) > 1:
+            segments = tuple(
+                RenderLineSegment(
+                    start=tuple(float(v) for v in bond_positions[item_idx, 0]),
+                    end=tuple(float(v) for v in bond_positions[item_idx, 1]),
+                    color=tuple(float(v) for v in bond_colors[item_idx, 0]),
+                    width_px=max(1.0, float(bond_radii[item_idx]) * settings.bond_scale),
+                )
+                for item_idx in indexes
+            )
+        else:
+            segments = build_bond_segments(
+                start,
+                end,
+                left_color,
+                right_color,
+                width_px=width_px,
+                order=order,
+                split=bool(record is not None and record.material_left is not None and record.material_right is not None and order == 1),
+                split_ratio=float(split_ratios[idx]) if idx < split_ratios.shape[0] else 0.5,
+            )
         preview_bond_style = str((record.metadata if record is not None else {}).get("preview_bond_style", "bicolor"))
         segments = _apply_preview_bond_style(segments, preview_bond_style, right_color=right_color)
         bonds.append(
@@ -359,8 +421,19 @@ class PreviewCanvasModel:
         shared_scene = build_buffer_preview_scene(structure, cfg, _shared_preview_settings(self.settings))
         return self.set_preview_scene(shared_scene)
 
-    def set_preview_scene(self, preview_scene: PreviewRenderScene | PreviewScene) -> PreviewRenderScene:
+    def set_preview_scene(
+        self,
+        preview_scene: PreviewRenderScene | PreviewScene,
+        *,
+        preserve_camera: bool | None = None,
+    ) -> PreviewRenderScene:
         current_view = self.camera.view or self.settings.default_view
+        previous_source = _scene_source(self.shared_scene or self.scene)
+        next_source = _scene_source(preview_scene)
+        should_preserve_camera = self.scene is not None and (
+            previous_source == next_source if preserve_camera is None else bool(preserve_camera)
+        )
+        camera_snapshot = replace(self.camera) if should_preserve_camera else None
         self.selection = None
         self.selection_controller.clear()
         self.selected_atom_indices.clear()
@@ -377,6 +450,8 @@ class PreviewCanvasModel:
             self.scene = render_scene_from_preview_scene(preview_scene, self.settings)
         self.fit_to_structure()
         self.set_view_preset(current_view)
+        if camera_snapshot is not None:
+            self.camera = camera_snapshot
         return self.scene
 
     def fit_to_structure(self, padding: float | None = None) -> PreviewCameraState:
@@ -392,7 +467,7 @@ class PreviewCanvasModel:
         return self.camera
 
     def set_view_preset(self, view: str) -> PreviewCameraState:
-        preset = str(view or "orbit").strip().lower()
+        preset = str(view or "top").strip().lower()
         self.camera.view = preset
         if preset == "top":
             self.camera.azimuth = 0.0
@@ -402,12 +477,12 @@ class PreviewCanvasModel:
             self.camera.up = (0.0, 1.0, 0.0)
             self.camera.forward = (0.0, 0.0, -1.0)
         elif preset == "front":
-            self.camera.azimuth = 0.0
+            self.camera.azimuth = 180.0
             self.camera.elevation = 0.0
             self.camera.roll = 0.0
-            self.camera.right = (1.0, 0.0, 0.0)
+            self.camera.right = (-1.0, 0.0, 0.0)
             self.camera.up = (0.0, 0.0, 1.0)
-            self.camera.forward = (0.0, 1.0, 0.0)
+            self.camera.forward = (0.0, -1.0, 0.0)
         elif preset == "side":
             self.camera.azimuth = 90.0
             self.camera.elevation = 0.0
@@ -424,6 +499,7 @@ class PreviewCanvasModel:
                 self.camera.elevation,
                 self.camera.roll,
             )
+        self.camera.model_rotation = tuple(float(value) for value in np.eye(4, dtype=np.float32).reshape((-1,)))
         return self.camera
 
     def select_preview_object(self, selection: PreviewSelection | None) -> PreviewSelection | None:
@@ -503,7 +579,13 @@ class PreviewCanvasModel:
             if int(atom.index) != target:
                 atoms.append(atom)
                 continue
-            position = tuple(float(v) for v in updates.get("position", atom.position))
+            base_position = np.asarray(updates.get("position", atom.position), dtype=float).reshape((3,))
+            if atom.record is not None:
+                metadata = getattr(atom.record, "metadata", {}) or {}
+                cart_shift = metadata.get("boundary_atom_cart_shift") if isinstance(metadata, dict) else None
+                if cart_shift is not None:
+                    base_position = base_position + np.asarray(cart_shift, dtype=float).reshape((3,))
+            position = tuple(float(v) for v in base_position)
             radius = float(updates.get("radius", atom.radius))
             symbol = str(updates.get("symbol", atom.symbol))
             representation = str(updates.get("representation", atom.representation))
@@ -751,16 +833,50 @@ class PreviewCanvasModel:
         )
 
     def pick_atom_at(self, pos: tuple[float, float], viewport_size: tuple[int, int]) -> PreviewSelection | None:
-        selection = self.hit_test_cache(viewport_size).pick_atom(pos)
+        selection = pick_selection(
+            self.scene,
+            self.camera,
+            viewport_size,
+            pos,
+            picking_radius_px=self.settings.picking_radius_px,
+            bond_scale=self.settings.bond_scale,
+        )
+        if selection is not None and selection.kind != "atom":
+            selection = None
         if selection is None:
             return None
         return self.select_preview_object(selection)
 
     def atom_indices_in_rect(self, start: tuple[float, float], end: tuple[float, float], viewport_size: tuple[int, int]) -> tuple[int, ...]:
-        return self.hit_test_cache(viewport_size).atoms_in_rect(start, end)
+        return atom_indices_in_rect(
+            self.scene,
+            self.camera,
+            viewport_size,
+            start,
+            end,
+            picking_radius_px=self.settings.picking_radius_px,
+        )
+
+    def bond_indices_in_rect(self, start: tuple[float, float], end: tuple[float, float], viewport_size: tuple[int, int]) -> tuple[int, ...]:
+        return bond_indices_in_rect(
+            self.scene,
+            self.camera,
+            viewport_size,
+            start,
+            end,
+            picking_radius_px=self.settings.picking_radius_px,
+            bond_scale=self.settings.bond_scale,
+        )
 
     def pick_bond_at(self, pos: tuple[float, float], viewport_size: tuple[int, int]) -> PreviewSelection | None:
-        selection = pick_bond_selection(self.scene, self.camera, viewport_size, pos)
+        selection = pick_bond_selection(
+            self.scene,
+            self.camera,
+            viewport_size,
+            pos,
+            picking_radius_px=self.settings.picking_radius_px,
+            bond_scale=self.settings.bond_scale,
+        )
         if selection is None:
             return None
         return self.select_preview_object(selection)
@@ -768,10 +884,18 @@ class PreviewCanvasModel:
     def pick_selection_at(self, pos: tuple[float, float], viewport_size: tuple[int, int]) -> PreviewSelection | None:
         return self.pick_at(pos, viewport_size)
 
+    def peek_selection_at(self, pos: tuple[float, float], viewport_size: tuple[int, int]) -> PreviewSelection | None:
+        return pick_selection(
+            self.scene,
+            self.camera,
+            viewport_size,
+            pos,
+            picking_radius_px=self.settings.picking_radius_px,
+            bond_scale=self.settings.bond_scale,
+        )
+
     def pick_at(self, pos: tuple[float, float], viewport_size: tuple[int, int]) -> PreviewSelection | None:
-        selection = self.hit_test_cache(viewport_size).pick_atom(pos)
-        if selection is None:
-            selection = pick_bond_selection(self.scene, self.camera, viewport_size, pos)
+        selection = self.peek_selection_at(pos, viewport_size)
         if selection is None:
             return None
         return self.select_preview_object(selection)

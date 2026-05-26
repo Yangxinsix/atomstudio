@@ -57,10 +57,9 @@ class HanddrawnMaterialBuilder:
         light_direction = _normalize_vec3(spec.light_direction)
         highlight_direction = _normalize_vec3(spec.highlight_direction)
         highlight_arc_length = max(0.0, min(1.0, float(spec.highlight_arc_length)))
-        highlight_band_inner = max(0.0, min(1.0, float(spec.highlight_band_inner)))
         highlight_band_outer = max(0.0, min(1.0, float(spec.highlight_band_outer)))
-        if highlight_band_outer <= highlight_band_inner:
-            highlight_band_outer = min(1.0, highlight_band_inner + 0.05)
+        if highlight_band_outer <= 0.0:
+            highlight_band_outer = 0.05
         # Old threshold was inverse semantics; keep direct "larger => longer arc".
         highlight_direction_threshold = max(0.0, min(1.0, 1.0 - highlight_arc_length))
 
@@ -123,21 +122,15 @@ class HanddrawnMaterialBuilder:
         r2_sum.name = "ASE_HAND_HIGHLIGHT_R2_SUM"
         r2_sum.operation = "ADD"
 
-        # Radial ring band in projected normal space:
-        # low < (nx^2 + ny^2) < high, then cut with top-right directional gate.
-        r_gt_low = nodes.new("ShaderNodeMath")
-        r_gt_low.name = "ASE_HAND_HIGHLIGHT_R_GT_LOW"
-        r_gt_low.operation = "GREATER_THAN"
-        r_gt_low.inputs[1].default_value = highlight_band_inner
-
         r_gt_high = nodes.new("ShaderNodeMath")
         r_gt_high.name = "ASE_HAND_HIGHLIGHT_R_GT_HIGH"
         r_gt_high.operation = "GREATER_THAN"
         r_gt_high.inputs[1].default_value = highlight_band_outer
 
-        rim_band = nodes.new("ShaderNodeMath")
-        rim_band.name = "ASE_HAND_HIGHLIGHT_R_BAND"
-        rim_band.operation = "SUBTRACT"
+        radial_mask = nodes.new("ShaderNodeMath")
+        radial_mask.name = "ASE_HAND_HIGHLIGHT_FILLED_MASK"
+        radial_mask.operation = "SUBTRACT"
+        radial_mask.inputs[0].default_value = 1.0
 
         highlight_dir_vec = nodes.new("ShaderNodeCombineXYZ")
         highlight_dir_vec.name = "ASE_HAND_HIGHLIGHT_DIR_VEC"
@@ -193,16 +186,14 @@ class HanddrawnMaterialBuilder:
         links.new(normal_sep.outputs["Y"], y_sq.inputs[1])
         links.new(x_sq.outputs["Value"], r2_sum.inputs[0])
         links.new(y_sq.outputs["Value"], r2_sum.inputs[1])
-        links.new(r2_sum.outputs["Value"], r_gt_low.inputs[0])
         links.new(r2_sum.outputs["Value"], r_gt_high.inputs[0])
-        links.new(r_gt_low.outputs["Value"], rim_band.inputs[0])
-        links.new(r_gt_high.outputs["Value"], rim_band.inputs[1])
+        links.new(r_gt_high.outputs["Value"], radial_mask.inputs[1])
         links.new(geom.outputs["Normal"], dir_dot.inputs[0])
         links.new(highlight_dir_vec.outputs["Vector"], dir_dot.inputs[1])
         links.new(dir_dot.outputs["Value"], dir_map.inputs[0])
         links.new(dir_map.outputs["Value"], dir_gate.inputs[0])
         links.new(dir_gate.outputs["Value"], highlight_dir_mul.inputs[0])
-        links.new(rim_band.outputs["Value"], highlight_dir_mul.inputs[1])
+        links.new(radial_mask.outputs["Value"], highlight_dir_mul.inputs[1])
         links.new(highlight_dir_mul.outputs["Value"], highlight_strength_node.inputs[0])
         links.new(shadow_mix.outputs["Color"], highlight_mix.inputs["Color1"])
         links.new(highlight_strength_node.outputs["Value"], highlight_mix.inputs["Fac"])

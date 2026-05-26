@@ -110,6 +110,28 @@ def scale_rgba(
     return (clamp01(rgba[0] * f), clamp01(rgba[1] * f), clamp01(rgba[2] * f), a)
 
 
+def _candidate_material_style(
+    name: str,
+    atom: MaterialSpec,
+    *,
+    polyhedra_alpha: float = 0.32,
+    cell_factor: float = 0.55,
+) -> MaterialStyle:
+    polyhedra = replace(
+        atom,
+        color=(0.56, 0.62, 0.70, polyhedra_alpha),
+        alpha=polyhedra_alpha,
+    )
+    cell = replace(atom, color=scale_rgba(_UNRESOLVED_COLOR, cell_factor), alpha=1.0)
+    return _style_with_uniform_elements(
+        name,
+        replace(atom),
+        replace(atom),
+        polyhedra,
+        cell,
+    )
+
+
 CLEAN_MATERIAL_STYLE = _style_with_uniform_elements(
     "clean",
     MaterialSpec(color=_UNRESOLVED_COLOR, roughness=0.32, specular=0.35, metallic=0.05, ior=1.45),
@@ -120,18 +142,56 @@ CLEAN_MATERIAL_STYLE = _style_with_uniform_elements(
 
 GLASS_MATERIAL_STYLE = _style_with_uniform_elements(
     "glass",
-    MaterialSpec(color=_UNRESOLVED_COLOR, roughness=0.04, specular=0.85, metallic=0.0, ior=1.52, alpha=0.88),
-    MaterialSpec(color=(0.68, 0.72, 0.78, 0.82), roughness=0.08, specular=0.70, metallic=0.0, ior=1.52, alpha=0.82),
-    MaterialSpec(color=(0.72, 0.78, 0.86, 0.35), roughness=0.06, specular=0.62, metallic=0.0, ior=1.52, alpha=0.35),
-    MaterialSpec(color=(0.56, 0.62, 0.70, 0.35), roughness=0.10, specular=0.60, metallic=0.0, ior=1.52, alpha=0.35),
+    MaterialSpec(
+        color=_UNRESOLVED_COLOR,
+        roughness=0.045,
+        specular=0.88,
+        metallic=0.0,
+        ior=1.52,
+        transmission=0.0,
+        coat=0.72,
+        coat_roughness=0.035,
+        alpha=1.0,
+    ),
+    MaterialSpec(
+        color=(0.62, 0.70, 0.82, 1.0),
+        roughness=0.075,
+        specular=0.56,
+        metallic=0.0,
+        ior=1.52,
+        transmission=0.0,
+        coat=0.28,
+        coat_roughness=0.060,
+        alpha=1.0,
+    ),
+    MaterialSpec(
+        color=(0.72, 0.80, 0.92, 0.35),
+        roughness=0.055,
+        specular=0.72,
+        metallic=0.0,
+        ior=1.52,
+        transmission=0.20,
+        alpha=0.35,
+    ),
+    MaterialSpec(
+        color=(0.42, 0.48, 0.58, 1.0),
+        roughness=0.095,
+        specular=0.42,
+        metallic=0.0,
+        ior=1.52,
+        transmission=0.0,
+        coat=0.18,
+        coat_roughness=0.080,
+        alpha=1.0,
+    ),
 )
 
 CERAMIC_MATERIAL_STYLE = _style_with_uniform_elements(
     "ceramic",
-    MaterialSpec(color=_UNRESOLVED_COLOR, roughness=0.58, specular=0.14, metallic=0.0, ior=1.40),
-    MaterialSpec(color=(0.30, 0.30, 0.30, 1.0), roughness=0.62, specular=0.12, metallic=0.0, ior=1.40),
-    MaterialSpec(color=(0.44, 0.48, 0.54, 0.35), roughness=0.56, specular=0.10, metallic=0.0, ior=1.40, alpha=0.35),
-    MaterialSpec(color=(0.28, 0.28, 0.28, 1.0), roughness=0.68, specular=0.10, metallic=0.0, ior=1.40),
+    MaterialSpec(color=_UNRESOLVED_COLOR, roughness=0.86, specular=0.045, metallic=0.0, ior=1.38),
+    MaterialSpec(color=(0.24, 0.24, 0.24, 1.0), roughness=0.88, specular=0.035, metallic=0.0, ior=1.38),
+    MaterialSpec(color=(0.44, 0.48, 0.54, 0.32), roughness=0.84, specular=0.030, metallic=0.0, ior=1.38, alpha=0.32),
+    MaterialSpec(color=(0.24, 0.24, 0.24, 1.0), roughness=0.90, specular=0.030, metallic=0.0, ior=1.38),
 )
 
 METALLIC_MATERIAL_STYLE = _style_with_uniform_elements(
@@ -148,6 +208,164 @@ EMISSIVE_MATERIAL_STYLE = _style_with_uniform_elements(
     MaterialSpec(color=(0.36, 0.36, 0.40, 1.0), roughness=0.24, specular=0.52, metallic=0.05, coat=0.08, coat_roughness=0.20),
     MaterialSpec(color=(0.55, 0.62, 0.72, 0.35), roughness=0.20, specular=0.46, metallic=0.02, coat=0.06, coat_roughness=0.20, alpha=0.35),
     MaterialSpec(color=(0.34, 0.34, 0.36, 1.0), roughness=0.30, specular=0.45, metallic=0.04, coat=0.06, coat_roughness=0.24),
+)
+
+
+CLEAN_GLOSSY_MATERIAL_STYLE = _candidate_material_style(
+    "clean_glossy",
+    MaterialSpec(
+        color=_UNRESOLVED_COLOR,
+        roughness=0.16,
+        specular=0.72,
+        metallic=0.0,
+        ior=1.45,
+        coat=0.28,
+        coat_roughness=0.08,
+    ),
+)
+
+PORCELAIN_MATERIAL_STYLE = _candidate_material_style(
+    "porcelain",
+    MaterialSpec(
+        color=_UNRESOLVED_COLOR,
+        roughness=0.58,
+        specular=0.20,
+        metallic=0.0,
+        ior=1.45,
+        coat=0.24,
+        coat_roughness=0.22,
+    ),
+)
+
+SOLID_GLASS_MATERIAL_STYLE = _candidate_material_style(
+    "solid_glass",
+    MaterialSpec(
+        color=_UNRESOLVED_COLOR,
+        roughness=0.045,
+        specular=0.88,
+        metallic=0.0,
+        ior=1.52,
+        coat=0.72,
+        coat_roughness=0.035,
+    ),
+)
+
+JADE_MATERIAL_STYLE = _candidate_material_style(
+    "jade",
+    MaterialSpec(
+        color=_UNRESOLVED_COLOR,
+        roughness=0.20,
+        specular=0.55,
+        metallic=0.0,
+        ior=1.45,
+        subsurface=0.28,
+        coat=0.38,
+        coat_roughness=0.075,
+    ),
+)
+
+PEARL_MATERIAL_STYLE = _candidate_material_style(
+    "pearl",
+    MaterialSpec(
+        color=_UNRESOLVED_COLOR,
+        roughness=0.18,
+        specular=0.80,
+        metallic=0.0,
+        ior=1.45,
+        sheen=0.45,
+        subsurface=0.12,
+        coat=0.80,
+        coat_roughness=0.055,
+    ),
+)
+
+HOLOGRAPHIC_MATERIAL_STYLE = _candidate_material_style(
+    "holographic",
+    MaterialSpec(
+        color=_UNRESOLVED_COLOR,
+        roughness=0.12,
+        specular=0.90,
+        metallic=0.0,
+        ior=1.45,
+        coat=0.90,
+        coat_roughness=0.025,
+        emission_strength=0.035,
+    ),
+)
+
+WARM_CLAY_MATERIAL_STYLE = _candidate_material_style(
+    "warm_clay",
+    MaterialSpec(
+        color=_UNRESOLVED_COLOR,
+        roughness=0.95,
+        specular=0.025,
+        metallic=0.0,
+        ior=1.45,
+    ),
+)
+
+STUDIO_SATIN_MATERIAL_STYLE = _style_with_uniform_elements(
+    "studio_satin",
+    MaterialSpec(color=_UNRESOLVED_COLOR, roughness=0.22, specular=0.66, metallic=0.0, ior=1.46, coat=0.58, coat_roughness=0.075),
+    MaterialSpec(color=(0.34, 0.38, 0.40, 1.0), roughness=0.30, specular=0.44, metallic=0.10, ior=1.46, coat=0.22, coat_roughness=0.12),
+    MaterialSpec(color=(0.48, 0.56, 0.62, 0.28), roughness=0.32, specular=0.36, metallic=0.0, alpha=0.28),
+    MaterialSpec(color=(0.42, 0.44, 0.44, 1.0), roughness=0.46, specular=0.24, metallic=0.0),
+)
+
+STUDIO_PEARL_MATERIAL_STYLE = _style_with_uniform_elements(
+    "studio_pearl",
+    MaterialSpec(color=_UNRESOLVED_COLOR, roughness=0.20, specular=0.76, metallic=0.0, ior=1.45, sheen=0.18, subsurface=0.025, coat=0.70, coat_roughness=0.065),
+    MaterialSpec(color=(0.40, 0.42, 0.42, 1.0), roughness=0.32, specular=0.42, metallic=0.04, ior=1.45, coat=0.16, coat_roughness=0.12),
+    MaterialSpec(color=(0.58, 0.62, 0.64, 0.26), roughness=0.28, specular=0.38, alpha=0.26),
+    MaterialSpec(color=(0.48, 0.48, 0.46, 1.0), roughness=0.44, specular=0.22, metallic=0.0),
+)
+
+STUDIO_SOFTMETAL_MATERIAL_STYLE = _style_with_uniform_elements(
+    "studio_softmetal",
+    MaterialSpec(color=_UNRESOLVED_COLOR, roughness=0.18, specular=0.62, metallic=0.46, ior=1.45, coat=0.42, coat_roughness=0.085),
+    MaterialSpec(color=(0.30, 0.34, 0.36, 1.0), roughness=0.30, specular=0.38, metallic=0.30, coat=0.16, coat_roughness=0.16),
+    MaterialSpec(color=(0.48, 0.56, 0.64, 0.26), roughness=0.30, specular=0.34, metallic=0.08, alpha=0.26),
+    MaterialSpec(color=(0.38, 0.42, 0.44, 1.0), roughness=0.36, specular=0.32, metallic=0.22),
+)
+
+STUDIO_WHITE_CERAMIC_MATERIAL_STYLE = _style_with_uniform_elements(
+    "studio_white_ceramic",
+    MaterialSpec(color=_UNRESOLVED_COLOR, roughness=0.42, specular=0.28, metallic=0.0, ior=1.42, coat=0.24, coat_roughness=0.16),
+    MaterialSpec(color=(0.36, 0.38, 0.38, 1.0), roughness=0.50, specular=0.18, metallic=0.0),
+    MaterialSpec(color=(0.62, 0.62, 0.60, 0.24), roughness=0.48, specular=0.16, alpha=0.24),
+    MaterialSpec(color=(0.54, 0.54, 0.52, 1.0), roughness=0.56, specular=0.12, metallic=0.0),
+)
+
+STUDIO_MACRO_GLOSS_MATERIAL_STYLE = _style_with_uniform_elements(
+    "studio_macro_gloss",
+    MaterialSpec(color=_UNRESOLVED_COLOR, roughness=0.16, specular=0.78, metallic=0.0, ior=1.48, coat=0.76, coat_roughness=0.055),
+    MaterialSpec(color=(0.30, 0.34, 0.36, 1.0), roughness=0.24, specular=0.50, metallic=0.08, coat=0.24, coat_roughness=0.08),
+    MaterialSpec(color=(0.52, 0.60, 0.66, 0.26), roughness=0.22, specular=0.44, alpha=0.26),
+    MaterialSpec(color=(0.44, 0.46, 0.46, 1.0), roughness=0.34, specular=0.30, metallic=0.0),
+)
+
+STUDIO_PRODUCT_GLOSS_MATERIAL_STYLE = _style_with_uniform_elements(
+    "studio_product_gloss",
+    MaterialSpec(
+        color=_UNRESOLVED_COLOR,
+        roughness=0.24,
+        specular=0.52,
+        metallic=0.0,
+        ior=1.48,
+        coat=0.26,
+        coat_roughness=0.12,
+    ),
+    MaterialSpec(
+        color=(0.38, 0.42, 0.43, 1.0),
+        roughness=0.26,
+        specular=0.46,
+        metallic=0.05,
+        ior=1.46,
+        coat=0.18,
+        coat_roughness=0.10,
+    ),
+    MaterialSpec(color=(0.54, 0.62, 0.70, 0.26), roughness=0.20, specular=0.46, alpha=0.26),
+    MaterialSpec(color=(0.44, 0.46, 0.46, 1.0), roughness=0.32, specular=0.34, metallic=0.0),
 )
 
 
@@ -319,37 +537,25 @@ HANDDRAWN_V2_MATERIAL_STYLE = make_handdrawn_style(
 )
 
 
-MARBLE_MATERIAL_STYLE = _style_with_uniform_elements(
-    "marble",
-    MaterialSpec(
-        color=_UNRESOLVED_COLOR,
-        roughness=0.10,
-        specular=0.65,
-        metallic=0.0,
-        coat=0.65,
-        coat_roughness=0.05,
-        specular_tint=0.10,
-    ),
-    MaterialSpec(
-        color=(0.20, 0.20, 0.20, 1.0),
-        roughness=0.78,
-        specular=0.08,
-        metallic=0.0,
-        coat=0.0,
-        coat_roughness=0.08,
-        specular_tint=0.0,
-    ),
-    replace(CLEAN_MATERIAL_STYLE.polyhedra_default),
-    replace(CLEAN_MATERIAL_STYLE.cell_default),
-)
-
 MATERIAL_STYLE_LIBRARY: dict[str, MaterialStyle] = {
     "clean": CLEAN_MATERIAL_STYLE,
+    "clean_glossy": CLEAN_GLOSSY_MATERIAL_STYLE,
     "glass": GLASS_MATERIAL_STYLE,
     "ceramic": CERAMIC_MATERIAL_STYLE,
     "metallic": METALLIC_MATERIAL_STYLE,
     "emissive": EMISSIVE_MATERIAL_STYLE,
-    "marble": MARBLE_MATERIAL_STYLE,
+    "porcelain": PORCELAIN_MATERIAL_STYLE,
+    "solid_glass": SOLID_GLASS_MATERIAL_STYLE,
+    "jade": JADE_MATERIAL_STYLE,
+    "pearl": PEARL_MATERIAL_STYLE,
+    "holographic": HOLOGRAPHIC_MATERIAL_STYLE,
+    "warm_clay": WARM_CLAY_MATERIAL_STYLE,
+    "studio_satin": STUDIO_SATIN_MATERIAL_STYLE,
+    "studio_pearl": STUDIO_PEARL_MATERIAL_STYLE,
+    "studio_softmetal": STUDIO_SOFTMETAL_MATERIAL_STYLE,
+    "studio_white_ceramic": STUDIO_WHITE_CERAMIC_MATERIAL_STYLE,
+    "studio_macro_gloss": STUDIO_MACRO_GLOSS_MATERIAL_STYLE,
+    "studio_product_gloss": STUDIO_PRODUCT_GLOSS_MATERIAL_STYLE,
     "handdrawn": HANDDRAWN_MATERIAL_STYLE,
     "handdrawn_v2": HANDDRAWN_V2_MATERIAL_STYLE,
 }

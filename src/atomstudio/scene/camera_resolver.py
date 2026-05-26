@@ -51,6 +51,12 @@ def resolve_scene_camera(
             distance=distance,
             rotation=None if camera_cfg.rotation is None else str(camera_cfg.rotation),
             rotation_euler=None if camera_cfg.rotation_euler is None else tuple(float(v) for v in camera_cfg.rotation_euler),
+            model_rotation=None
+            if camera_cfg.model_rotation is None
+            else tuple(float(v) for v in camera_cfg.model_rotation),
+            model_translation=None
+            if camera_cfg.model_translation is None
+            else tuple(float(v) for v in camera_cfg.model_translation),
             view=str(camera_cfg.view),
             frame_scale=float(camera_cfg.frame_scale),
             ase_view_rotations=camera_cfg.ase_view.rotations,
@@ -58,6 +64,7 @@ def resolve_scene_camera(
             if camera_cfg.ase_view.axes_matrix is None
             else tuple(tuple(float(v) for v in row) for row in camera_cfg.ase_view.axes_matrix),
             metadata={"mode": "explicit_basis", "aspect_ratio": float(aspect_ratio)},
+            **_dof_kwargs(camera_cfg),
         )
 
     if camera_cfg.position is not None:
@@ -86,6 +93,12 @@ def resolve_scene_camera(
             distance=distance,
             rotation=None if camera_cfg.rotation is None else str(camera_cfg.rotation),
             rotation_euler=None if camera_cfg.rotation_euler is None else tuple(float(v) for v in camera_cfg.rotation_euler),
+            model_rotation=None
+            if camera_cfg.model_rotation is None
+            else tuple(float(v) for v in camera_cfg.model_rotation),
+            model_translation=None
+            if camera_cfg.model_translation is None
+            else tuple(float(v) for v in camera_cfg.model_translation),
             view=str(camera_cfg.view),
             frame_scale=float(camera_cfg.frame_scale),
             ase_view_rotations=camera_cfg.ase_view.rotations,
@@ -93,6 +106,7 @@ def resolve_scene_camera(
             if camera_cfg.ase_view.axes_matrix is None
             else tuple(tuple(float(v) for v in row) for row in camera_cfg.ase_view.axes_matrix),
             metadata={"mode": "explicit_position"},
+            **_dof_kwargs(camera_cfg),
         )
 
     right_t, up_t, forward_t = resolve_camera_basis(
@@ -135,6 +149,12 @@ def resolve_scene_camera(
         distance=fit["distance"],
         rotation=None if camera_cfg.rotation is None else str(camera_cfg.rotation),
         rotation_euler=None if camera_cfg.rotation_euler is None else tuple(float(v) for v in camera_cfg.rotation_euler),
+        model_rotation=None
+        if camera_cfg.model_rotation is None
+        else tuple(float(v) for v in camera_cfg.model_rotation),
+        model_translation=None
+        if camera_cfg.model_translation is None
+        else tuple(float(v) for v in camera_cfg.model_translation),
         view=str(camera_cfg.view),
         frame_scale=float(camera_cfg.frame_scale),
         ase_view_rotations=camera_cfg.ase_view.rotations,
@@ -142,7 +162,16 @@ def resolve_scene_camera(
         if camera_cfg.ase_view.axes_matrix is None
         else tuple(tuple(float(v) for v in row) for row in camera_cfg.ase_view.axes_matrix),
         metadata={"mode": "fit", "aspect_ratio": float(aspect_ratio)},
+        **_dof_kwargs(camera_cfg),
     )
+
+
+def _dof_kwargs(camera_cfg) -> dict[str, float | bool | None]:
+    return {
+        "dof_enabled": bool(getattr(camera_cfg, "dof_enabled", False)),
+        "focus_distance": getattr(camera_cfg, "focus_distance", None),
+        "aperture_fstop": float(getattr(camera_cfg, "aperture_fstop", 5.6)),
+    }
 
 
 def _normalize_points(

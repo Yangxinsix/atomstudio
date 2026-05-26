@@ -29,12 +29,14 @@ def _make_action(
     label: str,
     callback,
     *,
-    shortcut: str | None = None,
+    shortcut: str | list[str] | tuple[str, ...] | None = None,
     checkable: bool = False,
     checked: bool = False,
 ) -> Any:
     action = QtGui.QAction(label, window)
-    if shortcut:
+    if isinstance(shortcut, (list, tuple)):
+        action.setShortcuts([QtGui.QKeySequence(str(item)) for item in shortcut])
+    elif shortcut:
         action.setShortcut(shortcut)
     action.setCheckable(checkable)
     if checkable:
@@ -69,9 +71,13 @@ def build_main_menu(window: Any) -> MenuHandles:
     add(file_menu, "reload_current", "Reload Current", window.reload_current_input, shortcut="Ctrl+Shift+R")
     file_menu.addSeparator()
     add(file_menu, "export_render_config", "Export Render Config YAML...", window.export_render_config_yaml, shortcut="Ctrl+E")
+    add(file_menu, "export_render_script", "Export render script...", window.export_render_script)
     file_menu.addSeparator()
     add(file_menu, "quit", "Quit", window.close, shortcut="Ctrl+Q")
 
+    add(edit_menu, "undo", "Undo", window.undo_last_change, shortcut="Ctrl+Z")
+    add(edit_menu, "redo", "Redo", window.redo_last_change, shortcut=("Ctrl+Y", "Ctrl+Shift+Z"))
+    edit_menu.addSeparator()
     add(edit_menu, "copy_selection_summary", "Copy Selection Summary", window.copy_selection_summary, shortcut="Ctrl+C")
     add(edit_menu, "copy_selection_json", "Copy Selection JSON", window.copy_selection_json, shortcut="Ctrl+Shift+C")
     edit_menu.addSeparator()
@@ -85,6 +91,14 @@ def build_main_menu(window: Any) -> MenuHandles:
     add(view_menu, "view_front", "Front", lambda: window.set_preview_view("front"), shortcut="3")
     add(view_menu, "view_side", "Side", lambda: window.set_preview_view("side"), shortcut="4")
     view_menu.addSeparator()
+    add(
+        view_menu,
+        "toggle_wrap_atoms_into_cell",
+        "Wrap Atoms Into Cell",
+        lambda checked: window.set_wrap_atoms_into_cell(bool(checked)),
+        checkable=True,
+        checked=False,
+    )
     add(
         view_menu,
         "toggle_axis_overlay",
@@ -110,7 +124,7 @@ def build_main_menu(window: Any) -> MenuHandles:
         checked=True,
     )
 
-    add(select_menu, "clear_selection", "Clear Selection", window.clear_preview_selection, shortcut="Esc")
+    add(select_menu, "clear_selection", "Clear Selection", window.clear_preview_selection)
     add(select_menu, "next_atom", "Next Atom", lambda: window.cycle_selection("atom", 1), shortcut="]")
     add(select_menu, "previous_atom", "Previous Atom", lambda: window.cycle_selection("atom", -1), shortcut="[")
     add(select_menu, "next_bond", "Next Bond", lambda: window.cycle_selection("bond", 1), shortcut="}")

@@ -107,3 +107,47 @@ def build_boundary_expanded_structure(
 
     expanded.atoms = expanded_atoms
     return expanded
+
+
+def wrap_structure_into_cell(structure: Structure) -> Structure:
+    wrapped = Structure.from_dict(structure.to_dict())
+    if not wrapped.atoms or not any(bool(v) for v in wrapped.pbc):
+        return wrapped
+    positions = _ase_wrapped_positions(wrapped)
+    if positions is None:
+        positions = _fractional_wrapped_positions(wrapped)
+    if positions is None:
+        return wrapped
+    for atom, position in zip(wrapped.atoms, positions, strict=True):
+        atom.position = (float(position[0]), float(position[1]), float(position[2]))
+    return wrapped
+
+
+def _ase_wrapped_positions(structure: Structure) -> np.ndarray | None:
+    try:
+        from ase import Atoms
+
+        atoms = Atoms(
+            symbols=structure.symbols,
+            positions=structure.positions,
+            cell=structure.cell_vectors,
+            pbc=structure.pbc,
+        )
+        atoms.wrap()
+        return np.asarray(atoms.get_positions(), dtype=float).reshape((-1, 3))
+    except Exception:
+        return None
+
+
+def _fractional_wrapped_positions(structure: Structure) -> np.ndarray | None:
+    try:
+        frac = fractional_positions(structure)
+    except Exception:
+        return None
+
+    for axis, periodic in enumerate(structure.pbc):
+        if periodic:
+            frac[:, axis] = frac[:, axis] % 1.0
+
+    cell = np.asarray(structure.cell_vectors, dtype=float).reshape(3, 3)
+    return frac @ cell

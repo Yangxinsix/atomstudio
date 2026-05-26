@@ -16,6 +16,12 @@ except Exception:  # pragma: no cover
     Vector = None
 
 
+_PRESET_LIGHT_REFERENCE_EXTENT = 4.0
+_PRESET_LIGHT_MIN_ENERGY_SCALE = 0.0625
+_PRESET_LIGHT_MAX_ENERGY_SCALE = 2000.0
+_REFERENCE_CLAMPED_LIGHT_STYLES = {"style_sphere_showcase"}
+
+
 class LightingBuilder:
     def __init__(
         self,
@@ -64,6 +70,10 @@ class LightingBuilder:
             obj.data.energy = float(spec["energy"])
             if spec["type"] == "AREA":
                 obj.data.size = float(spec["size"])
+                if spec.get("shape") is not None and hasattr(obj.data, "shape"):
+                    obj.data.shape = str(spec["shape"]).upper()
+                if spec.get("size_y") is not None and hasattr(obj.data, "size_y"):
+                    obj.data.size_y = float(spec["size_y"])
             if spec["type"] == "SUN":
                 _apply_sun_angle(obj.data, spec.get("size", 1.0))
             color = spec.get("color")
@@ -102,7 +112,11 @@ class LightingBuilder:
             runtime = deepcopy(light)
             if style_name != "preview_softbox":
                 runtime.lock_to_camera = False
-            out.append(runtime.to_runtime_spec(center=center, extent=extent, intensity=self.intensity))
+            runtime_extent = _preset_light_runtime_extent(style_name, extent)
+            spec = runtime.to_runtime_spec(center=center, extent=runtime_extent, intensity=self.intensity)
+            if runtime.placement == "scaled_offset":
+                spec["energy"] = float(spec["energy"]) * _preset_light_energy_scale(runtime_extent)
+            out.append(spec)
         return out
 
 
@@ -115,6 +129,17 @@ def _center_extent(points: Sequence) -> tuple[Vector, float]:
     center = Vector(((min(xs) + max(xs)) * 0.5, (min(ys) + max(ys)) * 0.5, (min(zs) + max(zs)) * 0.5))
     extent = max(max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs), 1.0)
     return center, extent
+
+
+def _preset_light_energy_scale(extent: float) -> float:
+    scale = max(1.0e-6, float(extent)) / _PRESET_LIGHT_REFERENCE_EXTENT
+    return max(_PRESET_LIGHT_MIN_ENERGY_SCALE, min(_PRESET_LIGHT_MAX_ENERGY_SCALE, scale * scale))
+
+
+def _preset_light_runtime_extent(style_name: str, extent: float) -> float:
+    if str(style_name) in _REFERENCE_CLAMPED_LIGHT_STYLES:
+        return max(_PRESET_LIGHT_REFERENCE_EXTENT, float(extent))
+    return float(extent)
 
 
 def resolve_lighting_specs(

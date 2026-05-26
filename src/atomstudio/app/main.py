@@ -3,20 +3,16 @@ from __future__ import annotations
 import sys
 from typing import Any
 
-from atomstudio.render.config_resolver import load_batch_config
-from atomstudio.app.runtime import configure_qt_runtime
+from atomstudio.app.runtime import configure_native_opengl_runtime, configure_qt_runtime
 
 
-configure_qt_runtime()
 _configure_qt_runtime = configure_qt_runtime
-
-try:  # pragma: no cover - optional GUI dependency
-    from PySide6 import QtWidgets  # type: ignore
-except Exception:  # pragma: no cover
-    QtWidgets = None
+DEFAULT_PREVIEW_BACKEND = "opengl"
 
 
 def main(argv: list[str] | None = None, *, state: Any | None = None) -> int:
+    configure_native_opengl_runtime()
+    QtWidgets = _qt_widgets()
     if QtWidgets is None:
         raise RuntimeError("PySide6 is required to run the AtomStudio desktop application")
 
@@ -33,9 +29,15 @@ def run_app(
     *,
     input_path: str | None = None,
     config_path: str | None = None,
-    frame: str = "last",
+    frame: str = "all",
     state: Any | None = None,
+    preview_backend: str = DEFAULT_PREVIEW_BACKEND,
 ) -> int:
+    if _preview_backend_uses_vispy(preview_backend):
+        configure_qt_runtime(enable_vispy=True)
+    else:
+        configure_native_opengl_runtime()
+    QtWidgets = _qt_widgets()
     if QtWidgets is None:
         raise RuntimeError("PySide6 is required to run the AtomStudio desktop application")
 
@@ -46,8 +48,10 @@ def run_app(
     if app is None:
         app = QtWidgets.QApplication(list(sys.argv))
 
-    window = AtomStudioWindow(state=state)
+    window = AtomStudioWindow(state=state, preview_backend=preview_backend)
     if config_path:
+        from atomstudio.render.config_resolver import load_batch_config
+
         batch = load_batch_config(config_path)
         if len(batch.jobs) != 1:
             raise ValueError("Desktop app currently accepts config files with exactly one job")
@@ -60,6 +64,19 @@ def run_app(
     if input_path:
         window.load_input(input_path, frame)
     return int(app.exec()) if owns_app else 0
+
+
+def _preview_backend_uses_vispy(preview_backend: str | None) -> bool:
+    value = str(preview_backend or DEFAULT_PREVIEW_BACKEND).strip().lower()
+    return value not in {"opengl", "gl", "opengl-window", "gl-window", "opengl-widget", "gl-widget", "opengl-detached", "gl-detached"}
+
+
+def _qt_widgets():
+    try:  # pragma: no cover - optional GUI dependency
+        from PySide6 import QtWidgets  # type: ignore
+    except Exception:  # pragma: no cover
+        return None
+    return QtWidgets
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from itertools import product
 from math import sqrt
 from typing import Iterable
 
@@ -87,8 +88,10 @@ class SceneBuilder:
             draw_bonds=draw_bonds,
         )
 
-        atoms = tuple(_build_scene_atom(item) for item in atom_styles)
-        bonds = tuple(_build_scene_bond(item, atom_lookup={atom.index: atom for atom in atoms}) for item in bond_styles)
+        base_atoms = tuple(_build_scene_atom(item) for item in atom_styles)
+        atom_lookup = {atom.index: atom for atom in base_atoms}
+        bonds = tuple(_build_scene_bond(item, atom_lookup=atom_lookup) for item in bond_styles)
+        atoms = _with_boundary_atoms(base_atoms, working, effective_cfg)
         cell = tuple(_build_scene_cell_edges(working, effective_cfg, style_bundle=style_bundle))
         polyhedra = tuple(_build_scene_polyhedra(working, effective_cfg, style_bundle=style_bundle))
 
@@ -113,6 +116,11 @@ class SceneBuilder:
             "visible_bonds": sum(1 for bond in bonds if bond.visible),
             "cell_edges": len(cell),
             "polyhedra": len(polyhedra),
+        }
+        report["boundary_atoms"] = {
+            "enabled": bool(effective_cfg.structure.boundary_atoms.enabled),
+            "sigma": float(effective_cfg.structure.boundary_atoms.sigma),
+            "added": max(0, len(atoms) - len(base_atoms)),
         }
 
         metadata = dict(working.metadata)
@@ -173,6 +181,72 @@ def _build_scene_atom(item) -> SceneAtom:
         style=item.style_name,
         tag=str(item.tag),
     )
+
+
+def _with_boundary_atoms(
+    atoms: tuple[SceneAtom, ...],
+    structure: Structure,
+    cfg: RenderJobConfig,
+) -> tuple[SceneAtom, ...]:
+    boundary_cfg = cfg.structure.boundary_atoms
+    sigma = float(boundary_cfg.sigma)
+    if not bool(boundary_cfg.enabled) or sigma <= 0.0 or not atoms or not any(structure.pbc):
+        return atoms
+    try:
+        cell = np.asarray(structure.cell_vectors, dtype=float).reshape((3, 3))
+    except Exception:
+        return atoms
+    if not np.any(np.abs(cell) > 1e-8) or abs(float(np.linalg.det(cell))) <= 1e-12:
+        return atoms
+
+    inv_cell = np.linalg.inv(cell)
+    out: list[SceneAtom] = list(atoms)
+    for atom in atoms:
+        frac = np.asarray(atom.position, dtype=float).reshape((3,)) @ inv_cell
+        for offset in _boundary_atom_offsets(frac, structure.pbc, sigma=sigma):
+            cart_shift = np.asarray(offset, dtype=float) @ cell
+            image_position = np.asarray(atom.position, dtype=float).reshape((3,)) + cart_shift
+            metadata = dict(atom.metadata)
+            metadata.update(
+                {
+                    "boundary_atom": True,
+                    "boundary_atom_offset": list(offset),
+                    "boundary_atom_cart_shift": [float(v) for v in cart_shift],
+                }
+            )
+            payload = dict(atom.selection_payload)
+            payload["position"] = [float(v) for v in image_position]
+            out.append(
+                replace(
+                    atom,
+                    position=(float(image_position[0]), float(image_position[1]), float(image_position[2])),
+                    selection_payload=payload,
+                    metadata=metadata,
+                )
+            )
+    return tuple(out) if len(out) != len(atoms) else atoms
+
+
+def _boundary_atom_offsets(
+    frac: np.ndarray,
+    pbc: tuple[bool, bool, bool],
+    *,
+    sigma: float,
+) -> tuple[tuple[int, int, int], ...]:
+    axis_options: list[tuple[int, ...]] = []
+    for axis, periodic in enumerate(pbc):
+        if not bool(periodic):
+            axis_options.append((0,))
+            continue
+        value = float(frac[axis])
+        wrapped = value % 1.0
+        if abs(value - 1.0) <= sigma or wrapped >= 1.0 - sigma:
+            axis_options.append((0, -1))
+        elif abs(value) <= sigma or wrapped <= sigma:
+            axis_options.append((0, 1))
+        else:
+            axis_options.append((0,))
+    return tuple(offset for offset in product(*axis_options) if any(offset))
 
 
 def _build_scene_bond(item, *, atom_lookup: dict[int, SceneAtom]) -> SceneBond:
@@ -304,7 +378,7 @@ def _build_scene_cell_edges(
     show = bool(cfg.structure.draw_cell or cfg.structure.cell_style.show)
     if not show or not any(structure.pbc) or not has_cell(structure.cell_vectors):
         return ()
-    radius = max(0.01, float(cfg.structure.cell_style.radius))
+    radius = max(0.001, float(cfg.structure.cell_style.radius))
     material = resolve_cell_material(structure, cfg, style_bundle=style_bundle)
     out: list[SceneCellEdge] = []
     for idx, (start, end) in enumerate(cell_edges(structure.cell_vectors)):
@@ -357,6 +431,81 @@ def _build_scene_polyhedra(
             )
         )
     return tuple(out)
+
+
+def bake_preview_model_transform(scene: RenderScene) -> RenderScene:
+    rotation = _model_rotation_matrix(scene.camera.model_rotation)
+    translation = _model_translation_vector(scene.camera.model_translation)
+    if rotation is None and translation is None:
+        return scene
+    rot = np.eye(3, dtype=float) if rotation is None else rotation
+    shift = np.zeros(3, dtype=float) if translation is None else translation
+    pivot = np.asarray(scene.camera.center, dtype=float).reshape((3,))
+
+    def transform(point: tuple[float, float, float]) -> tuple[float, float, float]:
+        p = np.asarray(point, dtype=float).reshape((3,))
+        q = pivot + rot @ (p - pivot) + shift
+        return (float(q[0]), float(q[1]), float(q[2]))
+
+    transformed_atoms: list[SceneAtom] = []
+    for atom in scene.atoms:
+        position = transform(atom.position)
+        selection_payload = dict(atom.selection_payload)
+        if "position" in selection_payload:
+            selection_payload["position"] = [float(v) for v in position]
+        transformed_atoms.append(replace(atom, position=position, selection_payload=selection_payload))
+
+    transformed_bonds = tuple(
+        replace(
+            bond,
+            segments=tuple(
+                replace(segment, start=transform(segment.start), end=transform(segment.end))
+                for segment in bond.segments
+            ),
+        )
+        for bond in scene.bonds
+    )
+    transformed_cell_edges = tuple(
+        replace(edge, start=transform(edge.start), end=transform(edge.end))
+        for edge in scene.cell_edges
+    )
+    transformed_polyhedra = tuple(
+        replace(poly, vertex_positions=tuple(transform(point) for point in poly.vertex_positions))
+        for poly in scene.polyhedra
+    )
+    return replace(
+        scene,
+        atoms=tuple(transformed_atoms),
+        bonds=transformed_bonds,
+        cell_edges=transformed_cell_edges,
+        polyhedra=transformed_polyhedra,
+        camera=replace(scene.camera, model_rotation=None, model_translation=None),
+        config=replace(scene.config, camera=replace(scene.config.camera, model_rotation=None, model_translation=None)),
+    )
+
+
+def _model_rotation_matrix(value: object) -> np.ndarray | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 16:
+        return None
+    try:
+        matrix = np.asarray(value, dtype=float).reshape((4, 4))[:3, :3]
+    except (TypeError, ValueError):
+        return None
+    if np.allclose(matrix, np.eye(3, dtype=float), atol=1.0e-8):
+        return None
+    return matrix
+
+
+def _model_translation_vector(value: object) -> np.ndarray | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        return None
+    try:
+        vector = np.asarray(value, dtype=float).reshape((3,))
+    except (TypeError, ValueError):
+        return None
+    if np.allclose(vector, np.zeros(3, dtype=float), atol=1.0e-12):
+        return None
+    return vector
 
 
 def _triangulate_polyhedron(

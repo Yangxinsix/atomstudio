@@ -5,18 +5,34 @@ from dataclasses import asdict, is_dataclass, replace
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import yaml
 
-from atomstudio.config import RenderJobConfig
+from atomstudio.config import AtomStyleRuleConfig, BoundaryAtomsConfig, CellStyleConfig, RenderJobConfig
 from atomstudio.paths import normalize_host_path
+from atomstudio.preview.camera import model_rotation_euler_degrees
+from atomstudio.preview.gl.shader_styles import DEFAULT_SHADER_STYLE, resolve_shader_style
 from atomstudio.preview.selection import build_selection_payload as preview_build_selection_payload
 from atomstudio.preview.types import PreviewSelection
+from atomstudio.scene.builder import build_render_scene
+from atomstudio.scene.materials.specs import as_material_spec
+from atomstudio.structure.boundary import wrap_structure_into_cell
+from atomstudio.structure.bonding import BondEngine
+from atomstudio.structure.data import normalize_pair_key
+from atomstudio.structure.selectors import AtomSelector
+from atomstudio.structure.structure import Structure
+from atomstudio.visual_defaults import CELL_DEFAULT_COLOR
 
 from .control_panels import build_object_tab, build_render_tab, build_scene_tab
 from .inspector import SelectionInspector
 from .menus import MenuHandles, build_main_menu
 from .panels import apply_preview_scene, build_preview_host
-from .state import AppState, LoadedFrameBundle
+from .render_script_export import (
+    build_render_script_text,
+    default_batch_output_spec,
+    default_render_script_path,
+)
+from .state import AppState, AppUndoSnapshot, LoadedFrameBundle
 from .summary import build_structure_summary
 from .toolbars import ToolbarHandles, build_mouse_toolbar, build_view_toolbar
 from .workers import (
@@ -231,24 +247,32 @@ def _selection_summary(payload: dict[str, Any] | None) -> str:
     )
 
 
-def _selection_atom_objects(canvas: Any) -> list[dict[str, Any]]:
+def _selection_atom_objects(canvas: Any, structure: Structure | None = None) -> list[dict[str, Any]]:
     model = getattr(canvas, "model", None)
     scene = getattr(model, "scene", None)
     selected = getattr(model, "selected_ordered_atoms", None) or sorted(getattr(model, "selected_atom_indices", set()) or [])
     if scene is None or not selected:
         return []
     selected_set = {int(index) for index in selected}
-    atoms = [atom for atom in getattr(scene, "atoms", ()) if int(getattr(atom, "index", -1)) in selected_set]
+    atoms = [
+        atom
+        for atom in getattr(scene, "atoms", ())
+        if int(getattr(atom, "index", -1)) in selected_set
+        and not bool((getattr(getattr(atom, "record", None), "metadata", {}) or {}).get("boundary_atom"))
+    ]
     order = {int(index): position for position, index in enumerate(selected)}
     atoms.sort(key=lambda atom: order.get(int(atom.index), int(atom.index)))
     return [
-        {
-            "index": int(atom.index),
-            "symbol": str(atom.symbol),
-            "position": [float(value) for value in atom.position],
-            "color": [float(value) for value in atom.color],
-            "radius": float(atom.radius),
-        }
+        _add_fractional_to_atom_payload(
+            {
+                "index": int(atom.index),
+                "symbol": str(atom.symbol),
+                "position": [float(value) for value in atom.position],
+                "color": [float(value) for value in atom.color],
+                "radius": float(atom.radius),
+            },
+            structure,
+        )
         for atom in atoms
     ]
 
@@ -276,6 +300,118 @@ def _parse_float_tuple(text: str, *, length: int) -> tuple[float, ...]:
     return tuple(values)
 
 
+def _cell_matrix(structure: Structure | None) -> np.ndarray | None:
+    raw = getattr(structure, "cell_vectors", None) if structure is not None else None
+    if raw is None:
+        return None
+    try:
+        cell = np.asarray(raw, dtype=float).reshape((3, 3))
+    except Exception:
+        return None
+    if not np.any(np.abs(cell) > 1e-8) or abs(float(np.linalg.det(cell))) <= 1e-12:
+        return None
+    return cell
+
+
+def _fractional_from_position(structure: Structure | None, position: Any) -> tuple[float, float, float] | None:
+    cell = _cell_matrix(structure)
+    if cell is None:
+        return None
+    try:
+        cart = np.asarray(position, dtype=float).reshape((3,))
+    except Exception:
+        return None
+    frac = cart @ np.linalg.inv(cell)
+    return (float(frac[0]), float(frac[1]), float(frac[2]))
+
+
+def _position_from_fractional(structure: Structure | None, fractional: Any) -> tuple[float, float, float] | None:
+    cell = _cell_matrix(structure)
+    if cell is None:
+        return None
+    try:
+        frac = np.asarray(fractional, dtype=float).reshape((3,))
+    except Exception:
+        return None
+    cart = frac @ cell
+    return (float(cart[0]), float(cart[1]), float(cart[2]))
+
+
+def _format_vector(values: Any, *, digits: int = 6) -> str:
+    vector = [] if values is None else list(values)
+    return ", ".join(f"{float(vector[idx] if len(vector) > idx else 0.0):.{digits}f}" for idx in range(3))
+
+
+def _add_fractional_to_atom_payload(atom: dict[str, Any], structure: Structure | None) -> dict[str, Any]:
+    out = dict(atom)
+    position = out.get("position")
+    fractional = _fractional_from_position(structure, (0.0, 0.0, 0.0) if position is None else position)
+    if fractional is not None:
+        out["fractional"] = [float(value) for value in fractional]
+    return out
+
+
+def _add_fractional_to_selection_payload(payload: dict[str, Any] | None, structure: Structure | None) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return payload
+    out = dict(payload)
+    obj = out.get("object")
+    if isinstance(obj, dict) and obj.get("symbol") is not None:
+        out["object"] = _add_fractional_to_atom_payload(obj, structure)
+    objects = out.get("objects")
+    if isinstance(objects, list):
+        out["objects"] = [
+            _add_fractional_to_atom_payload(item, structure) if isinstance(item, dict) and item.get("symbol") is not None else item
+            for item in objects
+        ]
+    return out
+
+
+def _bond_pair_key(structure: Structure, bond: Any) -> str | None:
+    symbols = list(getattr(structure, "symbols", ()) or ())
+    a = int(getattr(bond, "a", -1))
+    b = int(getattr(bond, "b", -1))
+    if a < 0 or b < 0 or a >= len(symbols) or b >= len(symbols):
+        return None
+    return normalize_pair_key(f"{symbols[a]}-{symbols[b]}")
+
+
+def _changed_bond_rule_pair_keys(old_bonding: Any, new_bonding: Any) -> set[str]:
+    old_distances = {normalize_pair_key(str(key)): tuple(float(v) for v in value) for key, value in old_bonding.pair_distances.items()}
+    new_distances = {normalize_pair_key(str(key)): tuple(float(v) for v in value) for key, value in new_bonding.pair_distances.items()}
+    old_disabled = {normalize_pair_key(str(value)) for value in old_bonding.disabled_pairs}
+    new_disabled = {normalize_pair_key(str(value)) for value in new_bonding.disabled_pairs}
+    old_orders = {normalize_pair_key(str(key)): int(value) for key, value in old_bonding.order_rules.items()}
+    new_orders = {normalize_pair_key(str(key)): int(value) for key, value in new_bonding.order_rules.items()}
+
+    keys = set(old_distances) | set(new_distances) | old_disabled | new_disabled | set(old_orders) | set(new_orders)
+    changed: set[str] = set()
+    for key in keys:
+        if old_distances.get(key) != new_distances.get(key):
+            changed.add(key)
+            continue
+        if (key in old_disabled) != (key in new_disabled):
+            changed.add(key)
+            continue
+        if old_orders.get(key, 1) != new_orders.get(key, 1):
+            changed.add(key)
+    return changed
+
+
+def _sort_bonds_for_display(bonds: list[Any]) -> list[Any]:
+    return sorted(
+        bonds,
+        key=lambda bond: (
+            min(int(getattr(bond, "a", 0)), int(getattr(bond, "b", 0))),
+            max(int(getattr(bond, "a", 0)), int(getattr(bond, "b", 0))),
+            str(getattr(bond, "bond_type", "")),
+        ),
+    )
+
+
+_NO_ELEMENT_STYLE_CHANGE = object()
+
+
 def _app_style_sheet() -> str:
     return """
 AtomStudioWindow {
@@ -299,7 +435,7 @@ QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
     min-height: 28px;
     max-height: 28px;
 }
-QRadioButton {
+QRadioButton, QCheckBox {
     font-size: 12pt;
     spacing: 8px;
     min-height: 26px;
@@ -327,9 +463,10 @@ QPlainTextEdit#inspectorMetadataView {
 if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are installed
 
     class AtomStudioWindow(QtWidgets.QMainWindow):
-        def __init__(self, *, state: AppState | None = None) -> None:
+        def __init__(self, *, state: AppState | None = None, preview_backend: str = "opengl") -> None:
             super().__init__()
             self.state = state or AppState()
+            self.preview_backend = self._normalize_preview_backend(preview_backend)
             self._threads: list[Any] = []
             self._preview_canvas = None
             self._frame_count = 0
@@ -338,9 +475,28 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
             self._mouse_toolbar_handles = ToolbarHandles()
             self._inspector_output_text: str | None = None
             self._render_in_progress = False
+            self._preview_shader_style = DEFAULT_SHADER_STYLE
+            self._syncing_preview_rotation_controls = False
+            self._syncing_element_style_controls = False
+            self._element_style_loaded_values: tuple[str, tuple[float, float, float, float], float] | None = None
+            self._element_radius_dirty = False
+            self._preview_request_serial = 0
 
             self._build_ui()
             self._sync_state_to_ui()
+
+        @staticmethod
+        def _normalize_preview_backend(preview_backend: str | None) -> str:
+            value = str(preview_backend or "opengl").strip().lower()
+            if value in {"opengl", "gl"}:
+                return "opengl"
+            if value in {"opengl-window", "gl-window"}:
+                return "opengl-window"
+            if value in {"opengl-widget", "gl-widget"}:
+                return "opengl-widget"
+            if value in {"opengl-detached", "gl-detached", "opengl-top", "gl-top"}:
+                return "opengl-detached"
+            return "vispy"
 
         def _build_ui(self) -> None:
             self.setObjectName("AtomStudioWindow")
@@ -368,7 +524,13 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
             left.setMinimumWidth(430)
             left.setMaximumWidth(560)
 
-            self._preview_canvas = build_preview_host(self)
+            if self.preview_backend in {"opengl", "opengl-window", "opengl-widget", "opengl-detached"}:
+                try:
+                    self._preview_canvas = build_preview_host(self, preview_backend=self.preview_backend)
+                except TypeError:
+                    self._preview_canvas = build_preview_host(self)
+            else:
+                self._preview_canvas = build_preview_host(self)
             if self._preview_canvas is None:
                 self._preview_canvas = QtWidgets.QLabel("Preview canvas unavailable")
                 self._preview_canvas.setAlignment(_resolve_qt_align_center())
@@ -427,6 +589,7 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
             self._inspector_dock.visibilityChanged.connect(self._on_inspector_visibility_changed)
             self._connect_preview_selection()
             self._connect_preview_interaction_messages()
+            self._connect_preview_camera_changes()
 
             self._update_window_title()
 
@@ -489,6 +652,43 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
             self.state.mark_dirty(reason)
             self._sync_state_to_ui()
 
+        def _capture_undo_snapshot(self, label: str) -> AppUndoSnapshot:
+            return self.state.capture_undo_snapshot(label)
+
+        def _commit_undo_snapshot(self, snapshot: AppUndoSnapshot) -> None:
+            self.state.push_undo_snapshot(snapshot)
+
+        def undo_last_change(self) -> None:
+            snapshot = self.state.undo()
+            if snapshot is None:
+                return
+            self._restore_preview_after_history_change()
+            self._append_log("info", f"Undo: {snapshot.label}")
+            self._sync_state_to_ui()
+
+        def redo_last_change(self) -> None:
+            snapshot = self.state.redo()
+            if snapshot is None:
+                return
+            self._restore_preview_after_history_change()
+            self._append_log("info", f"Redo: {snapshot.label}")
+            self._sync_state_to_ui()
+
+        def _restore_preview_after_history_change(self) -> None:
+            self._inspector_output_text = None
+            if self.state.preview_scene is not None:
+                apply_preview_scene(self._preview_canvas, self.state.preview_scene, frame_index=self.state.current_frame_index())
+                self._apply_preview_shader_style_to_canvas()
+            elif self.state.current_structure() is not None:
+                self._refresh_preview()
+            selection = self.state.selected_object
+            if selection is not None:
+                self._select_preview_object(selection.kind, selection.index)
+                return
+            method = getattr(self._preview_canvas, "clear_selection", None)
+            if callable(method):
+                method()
+
         def _connect_preview_selection(self) -> None:
             if self._preview_canvas is None:
                 return
@@ -503,6 +703,23 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
             signal = getattr(self._preview_canvas, "interaction_message_changed", None)
             if signal is not None and hasattr(signal, "connect"):
                 signal.connect(self._on_canvas_interaction_message)
+            for signal_name, callback in (
+                ("delete_requested", self.delete_selected_objects),
+                ("undo_requested", self.undo_last_change),
+                ("redo_requested", self.redo_last_change),
+            ):
+                requested = getattr(self._preview_canvas, signal_name, None)
+                if requested is not None and hasattr(requested, "connect"):
+                    requested.connect(callback)
+
+        def _connect_preview_camera_changes(self) -> None:
+            signal = getattr(self._preview_canvas, "camera_changed", None)
+            if signal is not None and hasattr(signal, "connect"):
+                signal.connect(self._on_preview_camera_changed)
+            self._sync_preview_rotation_controls()
+
+        def _on_preview_camera_changed(self, _camera: Any = None) -> None:
+            self._sync_preview_rotation_controls()
 
         def _set_action_checked(self, key: str, checked: bool) -> None:
             action = self._menu_handles.actions.get(key)
@@ -540,9 +757,12 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
             enable_map = {
                 "reload_current": has_structure or bool(self._input_path_edit.text().strip()),
                 "export_render_config": self.state.render_config is not None,
+                "export_render_script": has_structure and self.state.render_config is not None,
                 "copy_selection_summary": has_selection,
                 "copy_selection_json": has_selection,
                 "delete_selection": has_selection,
+                "undo": self.state.can_undo(),
+                "redo": self.state.can_redo(),
                 "fit_to_structure": self.state.preview_scene is not None,
                 "reset_camera": self.state.preview_scene is not None,
                 "clear_selection": has_selection,
@@ -566,7 +786,7 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
             self._selection_label.setText(_selection_summary(self.state.selected_payload))
             self._update_window_title()
             if self.state.render_config is not None:
-                output_path = normalize_host_path(self.state.render_config.output.path or self.state.render_config.output.dir or "")
+                output_path = normalize_host_path(self.state.render_config.output.path or "")
                 if self._output_path_edit.text() != output_path:
                     self._output_path_edit.setText(output_path)
                 self._sync_config_controls(self.state.render_config)
@@ -575,13 +795,23 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
                 if current is not None:
                     total = self.state.bundle.frame_count
                     self._frame_label.setText(f"Frame {self.state.bundle.selected_index + 1} of {total} (source {current.frame_index})")
-                    self._animation_scope_label.setText(f"All loaded frames ({total})")
+                    self._sync_animation_range_controls(total)
+                    step = self._animation_frame_step()
+                    start, end = self._animation_frame_range()
+                    animation_count = self._animation_structure_count()
+                    if step <= 1 and start == 0 and end == total:
+                        self._animation_scope_label.setText(f"All loaded frames ({total})")
+                    else:
+                        self._animation_scope_label.setText(
+                            f"{animation_count} of {total} loaded frames ({start + 1}-{end}, step {step})"
+                        )
                 else:
                     self._frame_label.setText("No frame selected")
                     self._animation_scope_label.setText("No frames loaded")
             else:
                 self._frame_label.setText("No frames loaded")
                 self._animation_scope_label.setText("No frames loaded")
+                self._sync_animation_range_controls(0)
             self._frame_slider.blockSignals(True)
             try:
                 if self.state.bundle is None or self.state.bundle.frame_count == 0:
@@ -590,12 +820,18 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
                     self._frame_slider.setMaximum(0)
                     self._frame_slider.setValue(0)
                 else:
-                    self._frame_slider.setEnabled(True)
+                    self._frame_slider.setEnabled(self.state.bundle.frame_count > 1)
                     self._frame_slider.setMinimum(0)
                     self._frame_slider.setMaximum(self.state.bundle.frame_count - 1)
                     self._frame_slider.setValue(self.state.bundle.selected_index)
             finally:
                 self._frame_slider.blockSignals(False)
+            frame_count = self.state.bundle.frame_count if self.state.bundle is not None else 0
+            selected_index = self.state.bundle.selected_index if self.state.bundle is not None else 0
+            self._first_frame_button.setEnabled(frame_count > 1 and selected_index > 0)
+            self._previous_frame_button.setEnabled(frame_count > 1 and selected_index > 0)
+            self._next_frame_button.setEnabled(frame_count > 1 and selected_index < frame_count - 1)
+            self._last_frame_button.setEnabled(frame_count > 1 and selected_index < frame_count - 1)
             if self._inspector_dock.isVisible() != self.state.dock_visibility.inspector_visible:
                 self._inspector_dock.setVisible(self.state.dock_visibility.inspector_visible)
             if self._log_dock.isVisible() != self.state.dock_visibility.log_visible:
@@ -606,6 +842,7 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
             self._set_action_checked("toggle_inspector_dock", self.state.dock_visibility.inspector_visible)
             self._set_action_checked("toggle_status_log", self.state.dock_visibility.log_visible)
             self._set_action_checked("toggle_axis_overlay", self.state.dock_visibility.axis_overlay_visible)
+            self._set_action_checked("toggle_wrap_atoms_into_cell", self.state.wrap_atoms_into_cell)
             self._sync_style_actions()
             self._sync_action_states()
             self._inspector.set_payload(self.state.selected_payload)
@@ -635,11 +872,41 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
                 self._bond_radius_spin.setValue(float(cfg.structure.bond_radius))
             finally:
                 self._bond_radius_spin.blockSignals(previous)
+            if hasattr(self, "_show_hydrogen_bonds_check"):
+                previous_hbond = self._show_hydrogen_bonds_check.blockSignals(True)
+                try:
+                    self._show_hydrogen_bonds_check.setChecked(bool(cfg.structure.bonding.hbond.enabled))
+                finally:
+                    self._show_hydrogen_bonds_check.blockSignals(previous_hbond)
+            self._set_combo_data(self._render_engine_combo, str(cfg.render.engine or "cycles"))
+            self._set_combo_data(self._render_device_combo, str(cfg.render.device or "auto"))
+            previous_cell_show = self._cell_show_check.blockSignals(True)
+            previous_cell_radius = self._cell_radius_spin.blockSignals(True)
+            previous_cell_color = self._cell_color_edit.blockSignals(True)
+            previous_cell_transparent = self._cell_transparent_check.blockSignals(True)
+            previous_boundary_atoms = self._boundary_atoms_check.blockSignals(True)
+            previous_boundary_sigma = self._boundary_atom_sigma_spin.blockSignals(True)
+            try:
+                self._cell_show_check.setChecked(bool(cfg.structure.draw_cell or cfg.structure.cell_style.show))
+                self._cell_radius_spin.setValue(float(cfg.structure.cell_style.radius))
+                cell_color = cfg.structure.cell_style.color or CELL_DEFAULT_COLOR
+                self._cell_color_edit.setText(_color_text(cell_color))
+                self._set_color_button(self._cell_color_button, cell_color)
+                self._cell_transparent_check.setChecked(bool(cfg.structure.cell_style.transparent))
+                self._boundary_atoms_check.setChecked(bool(cfg.structure.boundary_atoms.enabled))
+                self._boundary_atom_sigma_spin.setValue(float(cfg.structure.boundary_atoms.sigma))
+            finally:
+                self._cell_show_check.blockSignals(previous_cell_show)
+                self._cell_radius_spin.blockSignals(previous_cell_radius)
+                self._cell_color_edit.blockSignals(previous_cell_color)
+                self._cell_transparent_check.blockSignals(previous_cell_transparent)
+                self._boundary_atoms_check.blockSignals(previous_boundary_atoms)
+                self._boundary_atom_sigma_spin.blockSignals(previous_boundary_sigma)
             self._set_button_group_value(self._atom_representation_buttons, str(cfg.structure.representation or "ball_stick"))
-            self._set_button_group_value(self._scene_style_buttons, str(cfg.style.scene_style or "default"))
+            self._set_button_group_value(self._scene_style_buttons, self._preview_shader_style)
             self._set_combo_data(self._render_style_combo, str(cfg.style.scene_style or "default"))
             self._set_button_group_value(self._camera_projection_buttons, str(cfg.camera.projection or "ORTHOGRAPHIC").upper())
-            self._set_button_group_value(self._bond_style_buttons, self._current_bond_style())
+            self._set_combo_data(self._bond_style_combo, self._current_bond_style())
             previous_transparent = self._transparent_bg_radio.blockSignals(True)
             previous_unicolor = self._unicolor_bg_radio.blockSignals(True)
             previous_background = self._background_color_edit.blockSignals(True)
@@ -702,57 +969,143 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
             if color is None and isinstance(material, dict):
                 color = material.get("color")
             self._object_edit_fields["symbol"].setText(str(obj.get("symbol", "")))
+            fractional = obj.get("fractional")
+            self._object_edit_fields["fractional"].setEnabled(fractional is not None)
+            self._object_edit_fields["fractional"].setText("" if fractional is None else _format_vector(fractional))
             self._object_edit_fields["position"].setText(", ".join(str(position[idx] if len(position) > idx else 0.0) for idx in range(3)))
             self._object_edit_fields["color"].setText(_color_text(color))
             self._object_edit_fields["radius"].setText("" if obj.get("radius") is None else str(obj.get("radius")))
             self._set_color_button(self._object_color_button, color)
 
         def _sync_element_symbol_choices(self) -> None:
-            structure = self.state.current_structure()
-            symbols = sorted({str(atom.symbol) for atom in structure.atoms}) if structure is not None else []
-            current = self._element_symbol_combo.currentText().strip()
+            structures = self._loaded_frames_or_current()
+            symbols = sorted({str(atom.symbol) for structure in structures for atom in structure.atoms})
+            current = self._selected_element_symbol()
             previous = self._element_symbol_combo.blockSignals(True)
+            self._syncing_element_style_controls = True
             try:
                 self._element_symbol_combo.clear()
-                self._element_symbol_combo.addItems(symbols)
-                if current:
-                    self._element_symbol_combo.setCurrentText(current)
+                for symbol in symbols:
+                    self._element_symbol_combo.addItem(symbol, symbol)
+                if current in symbols:
+                    self._set_combo_data(self._element_symbol_combo, current)
+                elif symbols:
+                    self._element_symbol_combo.setCurrentIndex(0)
+                else:
+                    self._element_symbol_combo.setCurrentIndex(-1)
             finally:
                 self._element_symbol_combo.blockSignals(previous)
+                self._syncing_element_style_controls = False
             self._populate_element_style_controls()
 
+        def _selected_element_symbol(self) -> str:
+            data = self._element_symbol_combo.currentData()
+            if data is not None:
+                return str(data).strip()
+            return self._element_symbol_combo.currentText().strip()
+
         def _populate_element_style_controls(self) -> None:
-            symbol = self._element_symbol_combo.currentText().strip()
-            color, radius = self._default_atom_style_for_symbol(symbol)
+            symbol = self._selected_element_symbol()
+            color, radius = self._resolved_element_default_style(symbol)
             previous_color = self._element_color_edit.blockSignals(True)
             previous_radius = self._element_radius_spin.blockSignals(True)
+            was_syncing = self._syncing_element_style_controls
+            self._syncing_element_style_controls = True
             try:
                 self._element_color_edit.setText(_color_text(color))
                 self._element_radius_spin.setValue(float(radius))
             finally:
                 self._element_color_edit.blockSignals(previous_color)
                 self._element_radius_spin.blockSignals(previous_radius)
+                self._syncing_element_style_controls = was_syncing
             self._set_color_button(self._element_color_button, color)
+            self._element_style_loaded_values = (symbol, tuple(float(value) for value in color), float(radius))
+            self._element_radius_dirty = False
 
-        def _default_atom_style_for_symbol(self, symbol: str) -> tuple[tuple[float, float, float, float], float]:
-            symbol = str(symbol)
-            model_scene = getattr(getattr(self._preview_canvas, "model", None), "scene", None)
-            for atom in getattr(model_scene, "atoms", ()) if isinstance(getattr(model_scene, "atoms", ()), (list, tuple)) else ():
-                if str(getattr(atom, "symbol", "")) == symbol and hasattr(atom, "color"):
-                    return tuple(float(value) for value in atom.color), float(atom.radius)
-            for scene in (model_scene, self.state.preview_scene):
-                for record in getattr(scene, "atom_records", ()) or ():
-                    if str(_record_field(record, "symbol", "")) == symbol:
-                        material = _record_field(record, "material", None)
-                        color = _record_field(material, "color", (0.7, 0.7, 0.7, 1.0))
-                        return tuple(float(value) for value in color), float(_record_field(record, "radius", 1.0))
-            structure = self.state.current_structure()
-            for atom in getattr(structure, "atoms", ()) or ():
-                if str(atom.symbol) == symbol:
-                    color = atom.color if atom.color is not None else (0.7, 0.7, 0.7, 1.0)
-                    radius = atom.radius if atom.radius is not None else 1.0
-                    return tuple(float(value) for value in color), float(radius)
+        def _resolved_element_default_style(self, symbol: str) -> tuple[tuple[float, float, float, float], float]:
+            structure = self._reference_structure_for_symbol(symbol)
+            cfg = self.state.render_config
+            if structure is None or cfg is None:
+                return (0.7, 0.7, 0.7, 1.0), 1.0
+            try:
+                default_structure = Structure.from_dict(structure.to_dict())
+                for atom in default_structure.atoms:
+                    if str(atom.symbol) != str(symbol):
+                        continue
+                    atom.color = None
+                    atom.radius = None
+                    atom.material = None
+                    atom.representation = None
+                    atom.style = None
+                scene = build_render_scene(default_structure, cfg)
+                for atom in scene.atoms:
+                    if str(atom.symbol) == str(symbol):
+                        return tuple(float(value) for value in as_material_spec(atom.material).color), float(atom.radius)
+            except Exception:
+                return (0.7, 0.7, 0.7, 1.0), 1.0
             return (0.7, 0.7, 0.7, 1.0), 1.0
+
+        def _mark_element_radius_dirty(self) -> None:
+            if not self._syncing_element_style_controls:
+                self._element_radius_dirty = True
+
+        @staticmethod
+        def _is_element_default_rule(rule: AtomStyleRuleConfig, symbol: str) -> bool:
+            selector = rule.selector
+            return (
+                selector.symbol == str(symbol)
+                and not selector.symbols
+                and not selector.indices
+                and selector.index_range is None
+                and selector.z_range is None
+                and not selector.tags
+            )
+
+        def _config_with_element_default_style(
+            self,
+            cfg: RenderJobConfig,
+            symbol: str,
+            *,
+            color: Any = _NO_ELEMENT_STYLE_CHANGE,
+            radius: Any = _NO_ELEMENT_STYLE_CHANGE,
+        ) -> RenderJobConfig:
+            rules = list(cfg.style.atom_style_rules)
+            for index, rule in enumerate(rules):
+                if not self._is_element_default_rule(rule, symbol):
+                    continue
+                rules[index] = replace(
+                    rule,
+                    color=rule.color if color is _NO_ELEMENT_STYLE_CHANGE else tuple(float(value) for value in color),
+                    radius=rule.radius if radius is _NO_ELEMENT_STYLE_CHANGE else float(radius),
+                )
+                break
+            else:
+                rules.append(
+                    AtomStyleRuleConfig(
+                        selector=AtomSelector(symbol=str(symbol)),
+                        color=None if color is _NO_ELEMENT_STYLE_CHANGE else tuple(float(value) for value in color),
+                        radius=None if radius is _NO_ELEMENT_STYLE_CHANGE else float(radius),
+                    )
+                )
+            return replace(cfg, style=replace(cfg.style, atom_style_rules=rules))
+
+        @staticmethod
+        def _clear_element_overrides_that_shadow_default(
+            atoms: list[Any],
+            *,
+            old_color: tuple[float, float, float, float] | None,
+            new_color: tuple[float, float, float, float] | None,
+            color_changed: bool,
+            old_radius: float | None,
+            new_radius: float | None,
+            radius_changed: bool,
+        ) -> None:
+            for atom in atoms:
+                if color_changed:
+                    atom.color = None
+                if radius_changed:
+                    atom.radius = None
+                atom.sync_color_to_material()
 
         @staticmethod
         def _checked_button_value(group: Any, fallback: str) -> str:
@@ -765,6 +1118,9 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
         def _current_bond_style(self) -> str:
             structure = self.state.current_structure()
             bonds = getattr(structure, "bonds", ()) or ()
+            for bond in bonds:
+                if str(getattr(bond, "bond_type", "covalent")) != "hydrogen":
+                    return str(getattr(bond, "metadata", {}).get("preview_bond_style", "bicolor"))
             if bonds:
                 return str(getattr(bonds[0], "metadata", {}).get("preview_bond_style", "bicolor"))
             return "bicolor"
@@ -782,6 +1138,87 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
                 graphics=graphics,
             )
 
+        def _loaded_frames_or_current(self) -> list[Structure]:
+            if self.state.bundle is not None:
+                cached = self.state.bundle.cached_structures()
+                if cached:
+                    return cached
+            current = self.state.current_structure()
+            return [] if current is None else [current]
+
+        def _animation_frame_step(self) -> int:
+            control = getattr(self, "_animation_frame_step_spin", None)
+            value = control.value() if control is not None and hasattr(control, "value") else 1
+            return max(1, int(value))
+
+        def _sync_animation_range_controls(self, total: int) -> None:
+            start_control = getattr(self, "_animation_start_spin", None)
+            end_control = getattr(self, "_animation_end_spin", None)
+            if start_control is None or end_control is None:
+                return
+            maximum = max(1, int(total))
+            for control in (start_control, end_control):
+                previous = control.blockSignals(True)
+                try:
+                    control.setRange(1, maximum)
+                finally:
+                    control.blockSignals(previous)
+            previous_start = start_control.blockSignals(True)
+            previous_end = end_control.blockSignals(True)
+            try:
+                start_value = max(1, min(int(start_control.value()), maximum))
+                end_value = int(end_control.value())
+                if total > 0 and (end_value <= 1 or end_value > maximum):
+                    end_value = maximum
+                end_value = max(1, min(end_value, maximum))
+                if start_value > end_value:
+                    end_value = start_value
+                start_control.setValue(start_value)
+                end_control.setValue(end_value)
+            finally:
+                start_control.blockSignals(previous_start)
+                end_control.blockSignals(previous_end)
+
+        def _animation_frame_range(self) -> tuple[int, int]:
+            total = self.state.bundle.frame_count if self.state.bundle is not None else 0
+            if total <= 0:
+                return 0, 0
+            start_control = getattr(self, "_animation_start_spin", None)
+            end_control = getattr(self, "_animation_end_spin", None)
+            start_value = start_control.value() if start_control is not None and hasattr(start_control, "value") else 1
+            end_value = end_control.value() if end_control is not None and hasattr(end_control, "value") else total
+            start = max(1, min(int(start_value), total))
+            end = max(start, min(int(end_value), total))
+            return start - 1, end
+
+        def _animation_structure_count(self) -> int:
+            start, end = self._animation_frame_range()
+            if end <= start:
+                return 0
+            step = self._animation_frame_step()
+            return ((end - start - 1) // step) + 1
+
+        def _animation_structures(self) -> tuple[Structure, ...]:
+            if self.state.bundle is None:
+                return ()
+            start, end = self._animation_frame_range()
+            step = self._animation_frame_step()
+            return tuple(self.state.bundle.structures_in_range(start, end, step))
+
+        def _reference_structure_for_symbol(self, symbol: str) -> Structure | None:
+            for structure in self._loaded_frames_or_current():
+                if any(str(atom.symbol) == str(symbol) for atom in structure.atoms):
+                    return structure
+            return self.state.current_structure()
+
+        def _atoms_with_symbol_across_loaded_frames(self, symbol: str) -> list[Any]:
+            return [
+                atom
+                for structure in self._loaded_frames_or_current()
+                for atom in structure.atoms
+                if str(atom.symbol) == str(symbol)
+            ]
+
         def _update_window_title(self) -> None:
             title = "AtomStudio"
             if self.state.bundle is not None:
@@ -797,22 +1234,31 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
         def _step_frame(self, step: int) -> None:
             if self.state.bundle is None:
                 return
-            self._frame_slider.setValue(self.state.bundle.selected_index + int(step))
+            self._select_loaded_frame(self.state.bundle.selected_index + int(step))
 
         def _first_frame(self) -> None:
             if self.state.bundle is not None:
-                self._frame_slider.setValue(0)
+                self._select_loaded_frame(0)
 
         def _last_frame(self) -> None:
             if self.state.bundle is not None:
-                self._frame_slider.setValue(max(0, self.state.bundle.frame_count - 1))
+                self._select_loaded_frame(max(0, self.state.bundle.frame_count - 1))
 
         def _on_frame_slider_changed(self, value: int) -> None:
+            self._select_loaded_frame(int(value))
+
+        def _select_loaded_frame(self, value: int) -> None:
+            if self.state.bundle is None:
+                return
+            previous_index = int(self.state.bundle.selected_index)
             current = self.state.select_frame(int(value))
             if current is None:
                 return
+            if int(self.state.bundle.selected_index) == previous_index and int(value) == previous_index:
+                self._sync_state_to_ui()
+                return
             self.state.clear_selection()
-            self._refresh_preview()
+            self._refresh_preview(preserve_camera=True)
             self._sync_state_to_ui()
 
         def _resolve_load_request(self) -> LoadStructureRequest:
@@ -858,30 +1304,60 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
             structure = self.state.current_structure()
             if structure is None:
                 return None
+            if self.state.wrap_atoms_into_cell:
+                structure = wrap_structure_into_cell(structure)
             render_config = self._ensure_render_config(structure=structure)
             render_config = self._render_config_from_ui(render_config, include_preview_camera=False)
             self.state.set_render_config(render_config, mark_dirty=self.state.dirty)
             return PreviewRequest(structure=structure, render_config=render_config, preview_settings=None)
 
-        def _refresh_preview(self) -> None:
+        def _refresh_preview(self, *, preserve_camera: bool | None = None) -> None:
             request = self._build_preview_request()
             if request is None:
                 return
+            self._preview_request_serial += 1
+            request_serial = int(self._preview_request_serial)
+            request_frame_index = int(request.structure.frame_index)
             self.state.set_status("Updating preview...")
             self._sync_state_to_ui()
             worker = PreviewWorker(request)
             handle = start_background_task(
                 worker.run,
-                on_result=self._handle_preview_result,
+                on_result=lambda preview_scene: self._handle_preview_result(
+                    preview_scene,
+                    preserve_camera=preserve_camera,
+                    request_serial=request_serial,
+                    request_frame_index=request_frame_index,
+                ),
                 on_error=self._handle_task_error,
                 parent=self,
                 label="preview_update",
             )
             self._track_thread(handle)
 
-        def _handle_preview_result(self, preview_scene: Any) -> None:
+        def _handle_preview_result(
+            self,
+            preview_scene: Any,
+            *,
+            preserve_camera: bool | None = None,
+            request_serial: int | None = None,
+            request_frame_index: int | None = None,
+        ) -> None:
+            if request_serial is not None and int(request_serial) != int(self._preview_request_serial):
+                return
+            frame_index = self.state.current_frame_index() if request_frame_index is None else int(request_frame_index)
+            current_frame_index = self.state.current_frame_index()
+            if current_frame_index is not None and frame_index != int(current_frame_index):
+                return
             self.state.set_preview_scene(preview_scene)
-            apply_preview_scene(self._preview_canvas, preview_scene, frame_index=self.state.current_frame_index())
+            apply_preview_scene(
+                self._preview_canvas,
+                preview_scene,
+                frame_index=frame_index,
+                preserve_camera=preserve_camera,
+            )
+            self._apply_preview_shader_style_to_canvas()
+            self._sync_preview_rotation_controls()
             report = getattr(preview_scene, "report", None)
             renderer = report.get("preview_renderer") if isinstance(report, dict) else None
             if renderer == "unavailable":
@@ -892,8 +1368,9 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
 
         def _on_canvas_selection_changed(self, selection: PreviewSelection | None) -> None:
             self._inspector_output_text = None
-            payload = build_selection_payload(self.state.preview_scene, selection)
-            atom_objects = _selection_atom_objects(self._preview_canvas)
+            structure = self.state.current_structure()
+            payload = _add_fractional_to_selection_payload(build_selection_payload(self.state.preview_scene, selection), structure)
+            atom_objects = _selection_atom_objects(self._preview_canvas, structure)
             if atom_objects:
                 payload = dict(payload or {})
                 payload["objects"] = atom_objects
@@ -908,13 +1385,20 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
 
         def _on_inspector_object_edit(self, updates: dict[str, Any]) -> None:
             self._inspector_output_text = None
+            target_label = f"Updated atom {updates.get('index')}" if updates.get("index") is not None else "Updated atom"
+            undo_snapshot = self._capture_undo_snapshot(target_label)
             method = getattr(self._preview_canvas, "update_selected_atom_properties", None)
             if not callable(method) or not method(dict(updates)):
                 return
+            self._commit_undo_snapshot(undo_snapshot)
             self._apply_atom_updates_to_current_structure(updates)
             selection = getattr(getattr(self._preview_canvas, "model", None), "selection", None)
-            payload = build_selection_payload(getattr(getattr(self._preview_canvas, "model", None), "scene", None), selection)
-            atom_objects = _selection_atom_objects(self._preview_canvas)
+            structure = self.state.current_structure()
+            payload = _add_fractional_to_selection_payload(
+                build_selection_payload(getattr(getattr(self._preview_canvas, "model", None), "scene", None), selection),
+                structure,
+            )
+            atom_objects = _selection_atom_objects(self._preview_canvas, structure)
             if atom_objects:
                 payload = dict(payload or {})
                 payload["objects"] = atom_objects
@@ -940,19 +1424,29 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
                     atom.color = color if len(color) == 4 else (*color[:3], 1.0)
                 if updates.get("radius") is not None:
                     atom.radius = float(updates["radius"])
+                atom.sync_color_to_material()
                 self.state.mark_dirty(f"Updated atom {target}")
                 return
 
-        def _emit_selected_object_edit(self) -> None:
+        def _emit_selected_object_edit(self, *, position_source: str = "position") -> None:
             payload = self.state.selected_payload or {}
             obj = payload.get("object") if isinstance(payload, dict) else None
             if not isinstance(obj, dict) or obj.get("index") is None:
                 return
             try:
+                position = _parse_float_tuple(self._object_edit_fields["position"].text(), length=3)
+                if str(position_source) == "fractional":
+                    converted = _position_from_fractional(
+                        self.state.current_structure(),
+                        _parse_float_tuple(self._object_edit_fields["fractional"].text(), length=3),
+                    )
+                    if converted is None:
+                        raise ValueError("Fractional coordinates require a non-singular cell")
+                    position = converted
                 updates = {
                     "index": int(obj["index"]),
                     "symbol": self._object_edit_fields["symbol"].text().strip() or obj.get("symbol"),
-                    "position": _parse_float_tuple(self._object_edit_fields["position"].text(), length=3),
+                    "position": position,
                     "color": _parse_float_tuple(self._object_edit_fields["color"].text(), length=4),
                     "radius": float(self._object_edit_fields["radius"].text()),
                 }
@@ -1010,15 +1504,21 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
             )
 
         def _build_animation_request(self) -> AnimationRenderRequest | None:
-            if self.state.bundle is None or not self.state.bundle.frames:
+            if self.state.bundle is None or self.state.bundle.frame_count <= 0:
                 return None
-            structure = self.state.current_structure() or self.state.bundle.frames[0]
+            structures = self._animation_structures()
+            if not structures:
+                return None
+            structure = self.state.current_structure() or structures[0]
             render_config = self._ensure_render_config(structure=structure)
             render_config = self._render_config_from_ui(render_config, include_preview_camera=True)
             output_text = self._output_path_edit.text().strip() or render_config.output.path or _build_output_path(structure)
             output_dir, filename_template = _build_animation_output_spec(output_text, structure)
-            self._output_path_edit.setText(normalize_host_path(output_text))
-            render_config = replace(
+            static_output_path = normalize_host_path(output_text)
+            self._output_path_edit.setText(static_output_path)
+            render_config = render_config.with_output_path(static_output_path)
+            self.state.set_render_config(render_config, mark_dirty=self.state.dirty)
+            animation_config = replace(
                 render_config,
                 output=replace(
                     render_config.output,
@@ -1027,10 +1527,9 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
                     filename_template=filename_template,
                 ),
             )
-            self.state.set_render_config(render_config, mark_dirty=self.state.dirty)
             return AnimationRenderRequest(
-                structures=tuple(self.state.bundle.frames),
-                render_config=render_config,
+                structures=structures,
+                render_config=animation_config,
                 output_dir=output_dir,
                 filename_template=filename_template,
                 blender_path=self._blender_path_edit.text().strip() or None,
@@ -1238,6 +1737,10 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
                 background = _parse_float_tuple(self._background_color_edit.text(), length=4)
             except (TypeError, ValueError):
                 background = cfg.style.background or (1.0, 1.0, 1.0, 1.0)
+            try:
+                cell_color = _parse_float_tuple(self._cell_color_edit.text(), length=4)
+            except (TypeError, ValueError):
+                cell_color = cfg.structure.cell_style.color or CELL_DEFAULT_COLOR
             camera = replace(
                 cfg.camera,
                 projection=self._checked_button_value(self._camera_projection_group, cfg.camera.projection or "ORTHOGRAPHIC").upper(),
@@ -1258,10 +1761,24 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
                     sphere_rings=int(self._sphere_rings_spin.value()),
                     bond_vertices=int(self._bond_vertices_spin.value()),
                     bond_radius=float(self._bond_radius_spin.value()),
+                    draw_cell=bool(self._cell_show_check.isChecked()),
+                    cell_style=CellStyleConfig(
+                        show=bool(self._cell_show_check.isChecked()),
+                        radius=float(self._cell_radius_spin.value()),
+                        material=cfg.structure.cell_style.material,
+                        color=tuple(float(v) for v in cell_color),
+                        transparent=bool(self._cell_transparent_check.isChecked()),
+                    ),
+                    boundary_atoms=BoundaryAtomsConfig(
+                        enabled=bool(self._boundary_atoms_check.isChecked()),
+                        sigma=float(self._boundary_atom_sigma_spin.value()),
+                    ),
                 ),
                 camera=camera,
                 render=replace(
                     cfg.render,
+                    engine=self._combo_data(self._render_engine_combo, cfg.render.engine or "cycles"),
+                    device=self._combo_data(self._render_device_combo, cfg.render.device or "auto"),
                     samples=int(self._samples_spin.value()),
                     resolution=resolution,
                     transparent_bg=bool(self._transparent_bg_radio.isChecked()),
@@ -1275,6 +1792,18 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
             if camera is None:
                 return camera_cfg
             scale_factor = max(1e-6, float(getattr(camera, "scale_factor", 1.0)))
+            model_rotation = getattr(camera, "model_rotation", None)
+            model_rotation_tuple = (
+                tuple(float(v) for v in model_rotation)
+                if isinstance(model_rotation, (list, tuple)) and len(model_rotation) == 16
+                else None
+            )
+            model_translation = getattr(camera, "model_translation", None)
+            model_translation_tuple = (
+                tuple(float(v) for v in model_translation)
+                if isinstance(model_translation, (list, tuple)) and len(model_translation) == 3
+                else None
+            )
             return replace(
                 camera_cfg,
                 center=tuple(float(v) for v in getattr(camera, "center", (0.0, 0.0, 0.0))),
@@ -1283,6 +1812,8 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
                 forward=tuple(float(v) for v in getattr(camera, "forward", (0.0, 0.0, -1.0))),
                 ortho_scale=scale_factor,
                 distance=max(3.0, scale_factor),
+                model_rotation=model_rotation_tuple,
+                model_translation=model_translation_tuple,
                 view=str(getattr(camera, "view", camera_cfg.view) or camera_cfg.view),
                 fit_mode="gui",
             )
@@ -1291,9 +1822,22 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
             structure = self.state.current_structure()
             if structure is None:
                 return
+            self._preview_shader_style = resolve_shader_style(
+                self._checked_button_value(self._scene_style_group, self._preview_shader_style)
+            ).name
+            self._apply_preview_shader_style_to_canvas()
             cfg = self._render_config_from_ui(self._ensure_render_config(structure=structure), include_preview_camera=False)
+            undo_snapshot = self._capture_undo_snapshot("Updated scene settings")
             self.state.set_render_config(cfg, mark_dirty=True)
+            self._commit_undo_snapshot(undo_snapshot)
             self._refresh_preview()
+
+        def _apply_preview_shader_style_to_canvas(self) -> None:
+            for method_name in ("set_preview_shader_style", "set_shader_style"):
+                method = getattr(self._preview_canvas, method_name, None)
+                if callable(method):
+                    method(self._preview_shader_style)
+                    return
 
         def _apply_render_style_choice(self) -> None:
             style_name = self._combo_data(self._render_style_combo, "default")
@@ -1303,7 +1847,9 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
                 return
             structure_cfg = cfg.structure
             next_cfg = replace(cfg, style=replace(cfg.style, scene_style=style_name), structure=structure_cfg)
+            undo_snapshot = self._capture_undo_snapshot(f"Changed render style to {style_name}")
             self.state.set_render_config(next_cfg, mark_dirty=True)
+            self._commit_undo_snapshot(undo_snapshot)
             self._append_log("info", f"render style -> {style_name}")
             self._sync_state_to_ui()
             if structure is not None:
@@ -1317,15 +1863,23 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
                     return
                 cfg = self._ensure_render_config(structure=structure)
             next_cfg = self._render_config_from_ui(cfg, include_preview_camera=False)
+            undo_snapshot = self._capture_undo_snapshot("Updated render settings")
             self.state.set_render_config(next_cfg, mark_dirty=True)
+            self._commit_undo_snapshot(undo_snapshot)
             self._sync_state_to_ui()
 
         def _apply_element_style(self) -> None:
+            if self._syncing_element_style_controls:
+                return
             structure = self.state.current_structure()
             if structure is None:
                 return
-            symbol = self._element_symbol_combo.currentText().strip()
+            cfg = self._ensure_render_config(structure=structure)
+            symbol = self._selected_element_symbol()
             if not symbol:
+                return
+            matching_atoms = self._atoms_with_symbol_across_loaded_frames(symbol)
+            if not matching_atoms:
                 return
             try:
                 color = _parse_float_tuple(self._element_color_edit.text(), length=4) if self._element_color_edit.text().strip() else None
@@ -1333,13 +1887,45 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
             except (TypeError, ValueError):
                 self._append_log("error", "Invalid element style values")
                 return
-            for atom in structure.atoms:
-                if str(atom.symbol) == symbol:
-                    atom.radius = radius
-                    if color is not None:
-                        atom.color = color
-            self.state.mark_dirty(f"Updated {symbol} atom style")
-            self._refresh_preview()
+            baseline = self._element_style_loaded_values
+            if baseline is None or baseline[0] != symbol:
+                self._populate_element_style_controls()
+                return
+            baseline_color = baseline[1] if baseline is not None and baseline[0] == symbol else None
+            baseline_radius = baseline[2] if baseline is not None and baseline[0] == symbol else None
+            color_changed = color is not None and (
+                baseline_color is None
+                or any(abs(float(current) - float(previous)) > 1.0e-6 for current, previous in zip(color, baseline_color, strict=True))
+            )
+            radius_changed = self._element_radius_dirty and (
+                baseline_radius is None or abs(float(radius) - float(baseline_radius)) > 1.0e-6
+            )
+            if not color_changed and not radius_changed:
+                return
+            undo_snapshot = self._capture_undo_snapshot(f"Updated {symbol} atom style")
+            next_cfg = self._config_with_element_default_style(
+                cfg,
+                symbol,
+                color=color if color_changed and color is not None else _NO_ELEMENT_STYLE_CHANGE,
+                radius=radius if radius_changed else _NO_ELEMENT_STYLE_CHANGE,
+            )
+            self._clear_element_overrides_that_shadow_default(
+                matching_atoms,
+                old_color=baseline_color,
+                new_color=tuple(float(value) for value in color) if color_changed and color is not None else None,
+                color_changed=color_changed,
+                old_radius=float(baseline_radius) if baseline_radius is not None else None,
+                new_radius=float(radius) if radius_changed else None,
+                radius_changed=radius_changed,
+            )
+            self.state.set_render_config(next_cfg, mark_dirty=True)
+            self._commit_undo_snapshot(undo_snapshot)
+            self.state.mark_dirty(f"Updated {symbol} atom default style")
+            next_color, next_radius = self._resolved_element_default_style(symbol)
+            self._element_style_loaded_values = (symbol, tuple(float(value) for value in next_color), float(next_radius))
+            self._element_radius_dirty = False
+            self._populate_element_style_controls()
+            self._refresh_preview(preserve_camera=True)
 
         def _apply_bond_style(self) -> None:
             structure = self.state.current_structure()
@@ -1350,18 +1936,159 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
             except (TypeError, ValueError):
                 self._append_log("error", "Invalid bond color")
                 return
-            style = self._checked_button_value(self._bond_style_group, "bicolor")
-            for bond in structure.bonds:
-                bond.metadata["preview_bond_style"] = style
-                if style == "bicolor":
-                    bond.color = None
-                    bond.color_a = None
-                    bond.color_b = None
-                elif color is not None:
-                    bond.color = color
+            style = self._combo_data(self._bond_style_combo, "bicolor")
+            undo_snapshot = self._capture_undo_snapshot("Updated bond style")
+            self._apply_bond_style_to_loaded_frames(style=style, color=color)
             cfg = self._render_config_from_ui(self._ensure_render_config(structure=structure), include_preview_camera=False)
             self.state.set_render_config(cfg, mark_dirty=True)
-            self._refresh_preview()
+            self._commit_undo_snapshot(undo_snapshot)
+            self._refresh_preview(preserve_camera=True)
+
+        def _apply_hydrogen_bond_visibility(self) -> None:
+            structure = self.state.current_structure()
+            if structure is None:
+                return
+            cfg = self._render_config_from_ui(self._ensure_render_config(structure=structure), include_preview_camera=False)
+            enabled = bool(self._show_hydrogen_bonds_check.isChecked())
+            next_cfg = replace(
+                cfg,
+                structure=replace(
+                    cfg.structure,
+                    bonding=replace(
+                        cfg.structure.bonding,
+                        hbond=replace(cfg.structure.bonding.hbond, enabled=enabled),
+                    ),
+                ),
+            )
+            undo_snapshot = self._capture_undo_snapshot("Updated hydrogen bond visibility")
+            self._update_loaded_hydrogen_bonds(next_cfg)
+            self.state.set_render_config(next_cfg, mark_dirty=True)
+            self._commit_undo_snapshot(undo_snapshot)
+            self.state.mark_dirty("Updated hydrogen bond visibility")
+            self._refresh_preview(preserve_camera=True)
+
+        def _apply_bond_style_to_loaded_frames(self, *, style: str, color: Any | None) -> None:
+            for frame in self._loaded_frames_or_current():
+                for bond in frame.bonds:
+                    if str(getattr(bond, "bond_type", "covalent")) == "hydrogen":
+                        bond.metadata["preview_bond_style"] = "dashed"
+                        continue
+                    bond.metadata["preview_bond_style"] = style
+                    if style == "bicolor":
+                        bond.color = None
+                        bond.color_a = None
+                        bond.color_b = None
+                    elif color is not None:
+                        bond.color = tuple(float(value) for value in color)
+
+        def _open_bond_search_dialog(self) -> None:
+            structure = self.state.current_structure()
+            if structure is None:
+                self._append_log("error", "No structure is loaded")
+                return
+            cfg = self._render_config_from_ui(self._ensure_render_config(structure=structure), include_preview_camera=False)
+            self.state.set_render_config(cfg, mark_dirty=self.state.dirty)
+            from .bond_editor import BondSearchDialog
+
+            dialog = BondSearchDialog(
+                structure=structure,
+                config=cfg,
+                on_apply=lambda rules: self._apply_bond_search_rules(rules, label="Updated bond search rules"),
+                parent=self,
+            )
+            dialog.exec()
+
+        def _apply_bond_search_rules(self, rules: Any, *, label: str) -> None:
+            structure = self.state.current_structure()
+            if structure is None:
+                return
+            cfg = self._render_config_from_ui(self._ensure_render_config(structure=structure), include_preview_camera=False)
+            pair_distances = {
+                normalize_pair_key(str(key)): (float(value[0]), float(value[1]))
+                for key, value in dict(getattr(rules, "pair_distances", {}) or {}).items()
+            }
+            disabled_pairs = [normalize_pair_key(str(value)) for value in getattr(rules, "disabled_pairs", []) or []]
+            order_rules = {
+                normalize_pair_key(str(key)): int(value)
+                for key, value in dict(getattr(rules, "order_rules", {}) or {}).items()
+                if int(value) in {1, 2, 3}
+            }
+            next_cfg = replace(
+                cfg,
+                structure=replace(
+                    cfg.structure,
+                    bonding=replace(
+                        cfg.structure.bonding,
+                        pair_distances=dict(sorted(pair_distances.items())),
+                        disabled_pairs=sorted(disabled_pairs),
+                        order_rules=dict(sorted(order_rules.items())),
+                    ),
+                ),
+            )
+            undo_snapshot = self._capture_undo_snapshot(label)
+            self._update_loaded_bonds_for_pair_rule_changes(cfg.structure.bonding, next_cfg.structure.bonding, next_cfg)
+            self.state.set_render_config(next_cfg, mark_dirty=True)
+            self._commit_undo_snapshot(undo_snapshot)
+            self.state.mark_dirty(label)
+            self._refresh_preview(preserve_camera=True)
+
+        def _recompute_loaded_bonds(self, cfg: RenderJobConfig) -> None:
+            engine = BondEngine()
+            style = self._combo_data(self._bond_style_combo, "bicolor") if hasattr(self, "_bond_style_combo") else "bicolor"
+            try:
+                color = _parse_float_tuple(self._bond_color_edit.text(), length=4) if self._bond_color_edit.text().strip() else None
+            except (TypeError, ValueError):
+                color = None
+            frames = self._loaded_frames_or_current()
+            for frame in frames:
+                frame.bonds = engine.compute(frame, cfg.structure.bonding)
+            self._apply_bond_style_to_loaded_frames(style=style, color=color)
+
+        def _update_loaded_hydrogen_bonds(self, cfg: RenderJobConfig) -> None:
+            engine = BondEngine()
+            for frame in self._loaded_frames_or_current():
+                covalent_bonds = [
+                    bond for bond in frame.bonds if str(getattr(bond, "bond_type", "covalent")) != "hydrogen"
+                ]
+                if not covalent_bonds:
+                    covalent_bonds = engine.compute_covalent(frame, cfg.structure.bonding)
+                bonds = list(covalent_bonds)
+                bonds.extend(engine.compute_hydrogen_bonds(frame, cfg.structure.bonding, covalent_bonds=covalent_bonds))
+                frame.bonds = BondEngine.assign_ids(_sort_bonds_for_display(bonds))
+            self._restyle_loaded_bonds()
+
+        def _update_loaded_bonds_for_pair_rule_changes(self, old_bonding: Any, new_bonding: Any, cfg: RenderJobConfig) -> None:
+            changed_pairs = _changed_bond_rule_pair_keys(old_bonding, new_bonding)
+            if not changed_pairs:
+                self._restyle_loaded_bonds()
+                return
+            engine = BondEngine()
+            for frame in self._loaded_frames_or_current():
+                existing_covalent = [
+                    bond for bond in frame.bonds if str(getattr(bond, "bond_type", "covalent")) != "hydrogen"
+                ]
+                if not existing_covalent:
+                    frame.bonds = engine.compute(frame, cfg.structure.bonding)
+                    continue
+                kept_covalent = [
+                    bond
+                    for bond in existing_covalent
+                    if (_bond_pair_key(frame, bond) is not None and _bond_pair_key(frame, bond) not in changed_pairs)
+                ]
+                updated_covalent = engine.compute_covalent_pairs(frame, cfg.structure.bonding, changed_pairs)
+                covalent_bonds = _sort_bonds_for_display(kept_covalent + updated_covalent)
+                bonds = list(covalent_bonds)
+                bonds.extend(engine.compute_hydrogen_bonds(frame, cfg.structure.bonding, covalent_bonds=covalent_bonds))
+                frame.bonds = BondEngine.assign_ids(_sort_bonds_for_display(bonds))
+            self._restyle_loaded_bonds()
+
+        def _restyle_loaded_bonds(self) -> None:
+            style = self._combo_data(self._bond_style_combo, "bicolor") if hasattr(self, "_bond_style_combo") else "bicolor"
+            try:
+                color = _parse_float_tuple(self._bond_color_edit.text(), length=4) if self._bond_color_edit.text().strip() else None
+            except (TypeError, ValueError):
+                color = None
+            self._apply_bond_style_to_loaded_frames(style=style, color=color)
 
         def _preview_selection_records(self, kind: str) -> list[int]:
             scene = self.state.preview_scene
@@ -1449,6 +2176,54 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
             self.state.mark_clean()
             self._sync_state_to_ui()
 
+        def export_render_script(self) -> None:
+            structure = self.state.current_structure()
+            if structure is None:
+                self._append_log("warning", "No structure available to export render script")
+                self._sync_state_to_ui()
+                return
+            cfg = self.state.render_config
+            if cfg is None:
+                self._append_log("warning", "No render config available to export render script")
+                self._sync_state_to_ui()
+                return
+
+            cfg = self._render_config_from_ui(self._ensure_render_config(structure=structure), include_preview_camera=True)
+            output_path = normalize_host_path(self._output_path_edit.text().strip() or cfg.output.path or _build_output_path(structure))
+            self._output_path_edit.setText(output_path)
+            cfg = cfg.with_output_path(output_path)
+            self.state.set_render_config(cfg, mark_dirty=self.state.dirty)
+
+            source_path = (
+                self.state.bundle.source_path
+                if self.state.bundle is not None and self.state.bundle.source_path
+                else structure.source_path or cfg.input.path
+            )
+            output_dir, filename_template = default_batch_output_spec(output_path, source_path)
+            default_path = default_render_script_path(source_path)
+            path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                self,
+                "Export render script",
+                str(default_path),
+                "Python scripts (*.py);;All files (*)",
+            )
+            if not path:
+                return
+            path = normalize_host_path(path)
+            script = build_render_script_text(
+                render_config=cfg,
+                reference_structure=structure,
+                default_input_path=source_path,
+                default_frames="all",
+                default_out_dir=output_dir,
+                default_filename_template=filename_template,
+            )
+            with Path(path).expanduser().open("w", encoding="utf-8") as handle:
+                handle.write(script)
+            self._append_log("info", f"Exported render script to {path}")
+            self.state.mark_clean()
+            self._sync_state_to_ui()
+
         def copy_selection_summary(self) -> None:
             text = _selection_summary(self.state.selected_payload)
             QtWidgets.QApplication.clipboard().setText(text)
@@ -1463,20 +2238,35 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
             method = getattr(self._preview_canvas, "fit_to_structure", None)
             if callable(method):
                 method()
+            self._sync_preview_rotation_controls()
 
         def reset_preview_camera(self) -> None:
             self.fit_preview_to_structure()
-            self.set_preview_view("orbit")
+            self.set_preview_axis_view("c")
 
         def set_preview_view(self, view: str) -> None:
             method = getattr(self._preview_canvas, "set_view_preset", None)
             if callable(method):
                 method(str(view))
+            self._sync_preview_rotation_controls()
 
         def set_preview_axis_view(self, axis: str) -> None:
             method = getattr(self._preview_canvas, "set_axis_view", None)
             if callable(method):
                 method(str(axis))
+            self._sync_preview_rotation_controls()
+
+        def set_wrap_atoms_into_cell(self, enabled: bool) -> None:
+            enabled = bool(enabled)
+            if self.state.wrap_atoms_into_cell == enabled:
+                self._sync_state_to_ui()
+                return
+            self.state.wrap_atoms_into_cell = enabled
+            self.state.clear_selection()
+            self._append_log("info", f"Wrap atoms into cell {'enabled' if enabled else 'disabled'}")
+            if self.state.current_structure() is not None:
+                self._refresh_preview(preserve_camera=True)
+            self._sync_state_to_ui()
 
         def view_rotation_step_degrees(self) -> float:
             control = self._toolbar_handles.controls.get("rotation_step_degrees")
@@ -1492,6 +2282,55 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
             method = getattr(self._preview_canvas, "rotate_view", None)
             if callable(method):
                 method(str(axis), int(direction), self.view_rotation_step_degrees() if degrees is None else float(degrees))
+            self._sync_preview_rotation_controls()
+
+        def set_preview_model_rotation_from_toolbar(self) -> None:
+            if self._syncing_preview_rotation_controls:
+                return
+            controls = self._toolbar_handles.controls
+            x_control = controls.get("rotation_x_degrees")
+            y_control = controls.get("rotation_y_degrees")
+            z_control = controls.get("rotation_z_degrees")
+            if x_control is None or y_control is None or z_control is None:
+                return
+            method = getattr(self._preview_canvas, "set_model_rotation_angles", None)
+            if callable(method):
+                method(float(x_control.value()), float(y_control.value()), float(z_control.value()))
+
+        def _preview_model_rotation_angles(self) -> tuple[float, float, float] | None:
+            method = getattr(self._preview_canvas, "model_rotation_angles", None)
+            if callable(method):
+                values = method()
+                return tuple(float(value) for value in values[:3])
+            camera_method = getattr(self._preview_canvas, "current_camera_state", None)
+            camera = camera_method() if callable(camera_method) else getattr(getattr(self._preview_canvas, "model", None), "camera", None)
+            if camera is None:
+                return None
+            return model_rotation_euler_degrees(camera)
+
+        def _sync_preview_rotation_controls(self) -> None:
+            controls = getattr(self, "_toolbar_handles", ToolbarHandles()).controls
+            angle_controls = (
+                controls.get("rotation_x_degrees"),
+                controls.get("rotation_y_degrees"),
+                controls.get("rotation_z_degrees"),
+            )
+            if any(control is None for control in angle_controls):
+                return
+            angles = self._preview_model_rotation_angles()
+            if angles is None:
+                return
+            self._syncing_preview_rotation_controls = True
+            try:
+                for control, value in zip(angle_controls, angles, strict=True):
+                    previous = control.blockSignals(True) if hasattr(control, "blockSignals") else False
+                    try:
+                        control.setValue(float(value))
+                    finally:
+                        if hasattr(control, "blockSignals"):
+                            control.blockSignals(previous)
+            finally:
+                self._syncing_preview_rotation_controls = False
 
         def pan_preview_view(self, dx: float, dy: float) -> None:
             method = getattr(self._preview_canvas, "pan_view", None)
@@ -1502,6 +2341,7 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
             method = getattr(self._preview_canvas, "zoom_view", None)
             if callable(method):
                 method(float(factor))
+            self._sync_preview_rotation_controls()
 
         def set_mouse_mode(self, mode: str) -> None:
             method = getattr(self._preview_canvas, "set_mouse_mode", None)
@@ -1548,7 +2388,7 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
             model = getattr(self._preview_canvas, "model", None)
             atom_ids = {int(index) for index in getattr(model, "selected_atom_indices", set()) or set()}
             bond_ids = {int(index) for index in getattr(model, "selected_bond_indices", set()) or set()}
-            selection = getattr(model, "selection", None)
+            selection = getattr(model, "selection", None) or self.state.selected_object
             if selection is not None and getattr(selection, "index", None) is not None:
                 if selection.kind == "atom":
                     atom_ids.add(int(selection.index))
@@ -1557,34 +2397,74 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
             if not atom_ids and not bond_ids:
                 return
 
-            self._delete_from_current_structure(atom_ids, bond_ids)
+            undo_snapshot = self._capture_undo_snapshot("Deleted selected objects")
+            deleted_from_structure = self._delete_from_current_structure(atom_ids, bond_ids)
             method = getattr(self._preview_canvas, "delete_selected_objects", None)
             deleted = method() if callable(method) else {"atoms": len(atom_ids), "bonds": len(bond_ids)}
-            preview_scene = getattr(model, "scene", None)
-            if preview_scene is not None:
-                self.state.set_preview_scene(preview_scene)
+            if deleted_from_structure["atoms"] or deleted_from_structure["bonds"] or deleted.get("atoms") or deleted.get("bonds"):
+                self._commit_undo_snapshot(undo_snapshot)
             self.state.clear_selection()
             self.state.mark_dirty("Deleted selected objects")
-            self._append_log("info", f"Deleted {deleted.get('atoms', 0)} atom(s), {deleted.get('bonds', 0)} bond(s)")
-            self._sync_state_to_ui()
+            self._append_log(
+                "info",
+                f"Deleted {deleted_from_structure['atoms']} atom(s), {deleted_from_structure['bonds']} bond(s)",
+            )
+            if not self._refresh_preview_now(preserve_camera=True):
+                preview_scene = getattr(model, "scene", None)
+                if preview_scene is not None:
+                    self.state.set_preview_scene(preview_scene)
+                self._sync_state_to_ui()
 
-        def _delete_from_current_structure(self, atom_ids: set[int], bond_ids: set[int]) -> None:
+        def _delete_from_current_structure(self, atom_ids: set[int], bond_ids: set[int]) -> dict[str, int]:
             structure = self.state.current_structure()
             if structure is None:
-                return
+                return {"atoms": 0, "bonds": 0}
             atom_ids = {int(index) for index in atom_ids}
             bond_ids = {int(index) for index in bond_ids}
-            structure.atoms = [atom for atom in structure.atoms if int(atom.index) not in atom_ids]
-            structure.bonds = [
-                bond
-                for bond in structure.bonds
-                if int(bond.id) not in bond_ids and int(bond.a) not in atom_ids and int(bond.b) not in atom_ids
-            ]
+            old_atoms = list(structure.atoms)
+            old_bonds = list(structure.bonds)
+            kept_atoms = [atom for atom in old_atoms if int(atom.index) not in atom_ids]
+            remap = {int(atom.index): new_index for new_index, atom in enumerate(kept_atoms)}
+            structure.atoms = kept_atoms
+            for new_index, atom in enumerate(structure.atoms):
+                atom.index = int(new_index)
+            kept_bonds = []
+            for bond in old_bonds:
+                if int(bond.id) in bond_ids or int(bond.a) in atom_ids or int(bond.b) in atom_ids:
+                    continue
+                if int(bond.a) not in remap or int(bond.b) not in remap:
+                    continue
+                bond.a = int(remap[int(bond.a)])
+                bond.b = int(remap[int(bond.b)])
+                kept_bonds.append(bond)
+            structure.bonds = kept_bonds
+            for new_id, bond in enumerate(structure.bonds):
+                bond.id = int(new_id)
             structure.polyhedra = [
                 poly
                 for poly in structure.polyhedra
                 if int(poly.center) not in atom_ids and not (set(int(index) for index in poly.neighbor_indices) & atom_ids)
             ]
+            for poly in structure.polyhedra:
+                poly.center = int(remap.get(int(poly.center), int(poly.center)))
+                poly.neighbor_indices = [int(remap[index]) for index in poly.neighbor_indices if int(index) in remap]
+            return {
+                "atoms": len(old_atoms) - len(structure.atoms),
+                "bonds": len(old_bonds) - len(structure.bonds),
+            }
+
+        def _refresh_preview_now(self, *, preserve_camera: bool | None = None) -> bool:
+            request = self._build_preview_request()
+            if request is None:
+                return False
+            self._preview_request_serial += 1
+            try:
+                preview_scene = PreviewWorker(request).run()
+            except Exception as exc:
+                self._handle_task_error(exc)
+                return False
+            self._handle_preview_result(preview_scene, preserve_camera=preserve_camera)
+            return True
 
         def cycle_selection(self, kind: str, step: int) -> None:
             ids = self._preview_selection_records(kind)
@@ -1619,7 +2499,9 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
             else:
                 return
             next_cfg = replace(cfg, style=style, lighting=lighting)
+            undo_snapshot = self._capture_undo_snapshot(f"Changed {field_name} to {value}")
             self.state.set_render_config(next_cfg, mark_dirty=True)
+            self._commit_undo_snapshot(undo_snapshot)
             self._append_log("info", f"{field_name} -> {value}")
             self._sync_state_to_ui()
             self._refresh_preview()
@@ -1648,6 +2530,8 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
                 "\n".join(
                     [
                         "Ctrl+O: Open structure",
+                        "Ctrl+Z: Undo",
+                        "Ctrl+Y / Ctrl+Shift+Z: Redo",
                         "Ctrl+R: Refresh preview",
                         "Ctrl+Shift+P: Render final image",
                         "F: Fit to structure",
@@ -1676,7 +2560,9 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
         def set_render_config(self, cfg: RenderJobConfig) -> None:
             if cfg.output.path:
                 cfg = cfg.with_output_path(normalize_host_path(cfg.output.path))
+            undo_snapshot = self._capture_undo_snapshot("Loaded render config")
             self.state.set_render_config(cfg, mark_dirty=True)
+            self._commit_undo_snapshot(undo_snapshot)
             self._append_log("info", f"Loaded render config {cfg.id}")
             self._output_path_edit.setText(cfg.output.path or "")
             self._sync_state_to_ui()

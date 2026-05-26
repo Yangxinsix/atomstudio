@@ -4,6 +4,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from atomstudio.color_utils import coerce_color_fields
+from atomstudio.backend.blender.atom_batch import sphere_subdivisions, unit_icosphere_geometry
 from atomstudio.scene.materials.specs import MaterialLike
 from atomstudio.style.outline_style import OutlineRoleStyle
 
@@ -13,7 +14,7 @@ except Exception:  # pragma: no cover
     bpy = None
 
 
-_SPHERE_MESH_CACHE: dict[tuple[int, int, str | None], str] = {}
+_SPHERE_MESH_CACHE: dict[tuple[int, str | None], str] = {}
 
 
 _ATOMIC_NUMBER_FALLBACK = {
@@ -86,7 +87,10 @@ class Atom:
         segments = max(8, int(atom.segments if atom.segments is not None else 32))
         rings = max(4, int(atom.rings if atom.rings is not None else 16))
         radius = float(atom.radius if atom.radius is not None else 0.5)
-        mesh = _cached_uv_sphere_mesh(segments=segments, rings=rings, material=material)
+        mesh = _cached_icosphere_mesh(
+            subdivisions=sphere_subdivisions(segments=segments, rings=rings),
+            material=material,
+        )
         obj = bpy.data.objects.new(name or f"Atom_{atom.index}_{atom.symbol}", mesh)
         obj.location = atom.position
         obj.scale = (radius, radius, radius)
@@ -112,24 +116,20 @@ def _infer_atomic_number(symbol: str, raw_atomic_number: Any) -> int:
     return int(_ATOMIC_NUMBER_FALLBACK.get(str(symbol), 0))
 
 
-def _cached_uv_sphere_mesh(*, segments: int, rings: int, material: Any) -> Any:
+def _cached_icosphere_mesh(*, subdivisions: int, material: Any) -> Any:
     if bpy is None:
         raise RuntimeError("bpy is not available. Run this function inside Blender.")
 
-    key = (int(segments), int(rings), _material_cache_key(material))
+    key = (int(subdivisions), _material_cache_key(material))
     mesh_name = _SPHERE_MESH_CACHE.get(key)
     mesh = bpy.data.meshes.get(mesh_name) if mesh_name is not None else None
     if mesh is not None:
         return mesh
 
-    bpy.ops.mesh.primitive_uv_sphere_add(
-        segments=int(segments),
-        ring_count=int(rings),
-        radius=1.0,
-        location=(0.0, 0.0, 0.0),
-    )
-    obj = bpy.context.active_object
-    mesh = obj.data
+    vertices, faces = unit_icosphere_geometry(int(subdivisions))
+    mesh = bpy.data.meshes.new(f"AtomIcosphere_s{subdivisions}")
+    mesh.from_pydata(list(vertices), [], list(faces))
+    mesh.update()
     for poly in mesh.polygons:
         poly.use_smooth = True
     if material is not None:
@@ -137,7 +137,6 @@ def _cached_uv_sphere_mesh(*, segments: int, rings: int, material: Any) -> Any:
             mesh.materials.append(material)
         else:
             mesh.materials[0] = material
-    _remove_temporary_object(obj)
     _SPHERE_MESH_CACHE[key] = str(mesh.name)
     return mesh
 
@@ -154,9 +153,3 @@ def _material_cache_key(material: Any) -> str | None:
 def _link_object(obj: Any, *, collection: Any = None) -> None:
     target = collection if collection is not None else bpy.context.scene.collection
     target.objects.link(obj)
-
-
-def _remove_temporary_object(obj: Any) -> None:
-    for coll in list(obj.users_collection):
-        coll.objects.unlink(obj)
-    bpy.data.objects.remove(obj, do_unlink=True)

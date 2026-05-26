@@ -94,7 +94,7 @@ class Structure:
             vectors=[[float(v) for v in row] for row in atoms.get_cell().tolist()],
             pbc=tuple(bool(v) for v in atoms.get_pbc().tolist()),
             show=False,
-            radius=0.04,
+            radius=0.01,
         )
 
         return cls(
@@ -508,7 +508,7 @@ class Structure:
             vectors=[[float(v) for v in row] for row in cell_data.get("vectors", [[0.0, 0.0, 0.0] for _ in range(3)])],
             pbc=tuple(bool(v) for v in cell_data.get("pbc", [False, False, False])),
             show=bool(cell_data.get("show", False)),
-            radius=float(cell_data.get("radius", 0.04)),
+            radius=float(cell_data.get("radius", 0.01)),
             style=cell_data.get("style"),
             material=material_from_dict(cell_data.get("material")) if isinstance(cell_data.get("material"), dict) else None,
             color=parse_rgba(cell_data.get("color")),

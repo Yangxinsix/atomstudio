@@ -19,15 +19,23 @@ def _format_mapping(data: dict[str, Any] | None) -> str:
 
 def _atom_display_payload(atom: dict[str, Any]) -> dict[str, Any]:
     position = atom.get("position") or (0.0, 0.0, 0.0)
+    fractional = atom.get("fractional")
     color = atom.get("color")
     if color is None:
         color = atom.get("face_color")
-    return {
+    payload = {
         "symbol": atom.get("symbol"),
-        "position": ", ".join(f"{float(value):.5f}" for value in list(position)[:3]),
-        "color": color,
-        "radius": atom.get("radius"),
     }
+    if fractional is not None:
+        payload["fractional"] = ", ".join(f"{float(value):.5f}" for value in list(fractional)[:3])
+    payload.update(
+        {
+            "position": ", ".join(f"{float(value):.5f}" for value in list(position)[:3]),
+            "color": color,
+            "radius": atom.get("radius"),
+        }
+    )
+    return payload
 
 
 def _payload_atoms(payload: dict[str, Any] | None) -> list[dict[str, Any]]:

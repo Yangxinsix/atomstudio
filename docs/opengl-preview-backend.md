@@ -189,12 +189,33 @@ Camera-only interaction:
 ```text
 mouse drag/wheel
     -> PreviewController updates CameraState
-    -> QOpenGLWidget.update()
+    -> QOpenGLWidget.repaint() during active interaction
     -> paintGL()
     -> renderer.draw(new view/projection matrices)
 ```
 
 No geometry buffer rebuild should happen during camera-only interaction.
+Queued `update()` can be too aggressively coalesced on some WSL/GWSL stacks during rapid mouse motion, producing slideshow-like jumps even when GL draw time is low. The OpenGL backend defaults to `ATOMSTUDIO_INTERACTION_REPAINT=immediate`; set `ATOMSTUDIO_INTERACTION_REPAINT=update` only for platforms where synchronous repaint causes problems.
+
+Mouse movement events can also be coalesced by X11/GWSL. During drag, the OpenGL backend therefore defaults to a timer-driven camera loop that polls the current cursor/latest event position at a fixed cadence:
+
+```text
+ATOMSTUDIO_INTERACTION_DRIVER=timer
+ATOMSTUDIO_INTERACTION_TIMER_MS=8
+```
+
+Set `ATOMSTUDIO_INTERACTION_DRIVER=events` to return to pure mouse-event-driven camera updates.
+
+The first preview target is interaction latency rather than maximum visual smoothing. Native OpenGL preview defaults to a low-latency surface:
+
+```text
+ATOMSTUDIO_GL_DEPTH_BITS=24
+ATOMSTUDIO_GL_SAMPLES=0
+ATOMSTUDIO_GL_SWAP_INTERVAL=0
+ATOMSTUDIO_GL_VSYNC=0
+```
+
+Set `ATOMSTUDIO_GL_SAMPLES=4` to re-enable MSAA, or `ATOMSTUDIO_GL_VSYNC=1 ATOMSTUDIO_GL_SWAP_INTERVAL=1` to prefer synchronized presentation over latency.
 
 ## Draw Passes
 
@@ -334,7 +355,7 @@ Hard rules:
 - No mesh rebuild on camera movement.
 - No Python loop per object during draw.
 - No per-object OpenGL draw calls for atoms/bonds.
-- No Qt repaint/update storm during mouse drag.
+- No queued-update starvation during mouse drag; repaint camera-only frames immediately if the host coalesces paint events.
 - Geometry/style buffer upload only when scene/style changes.
 - Camera updates only update uniforms.
 
@@ -619,6 +640,18 @@ OpenGL context creation and cursor behavior can differ. The backend must report:
 - renderer/vendor
 - depth bits
 - MSAA samples
+
+AtomStudio runtime must not switch an existing GWSL/X11 session to WSLg automatically. If `DISPLAY` is set, keep `QT_QPA_PLATFORM=xcb` by default to avoid the WSLg cursor issues seen on this setup. The WSLg D3D12 hardware path can be selected explicitly with `ATOMSTUDIO_GL_PROFILE=wslg`, or implicitly when no X11 `DISPLAY` is available:
+
+```text
+QT_QPA_PLATFORM=wayland
+PYOPENGL_PLATFORM=egl
+GALLIUM_DRIVER=d3d12
+MESA_LOADER_DRIVER_OVERRIDE=d3d12
+MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA
+```
+
+`MESA_D3D12_DEFAULT_ADAPTER_NAME` is a substring match against the Windows D3D12 adapter name. The WSLg D3D12 profile defaults to `NVIDIA`; users can override it with `ATOMSTUDIO_GL_ADAPTER=Intel`, `ATOMSTUDIO_GL_ADAPTER=auto`, or by setting `MESA_D3D12_DEFAULT_ADAPTER_NAME` directly. `ATOMSTUDIO_GL_PROFILE=system` disables the WSLg D3D12 defaults and leaves platform selection to the host environment.
 
 ### PyOpenGL Overhead
 Acceptable if draw calls are batched. Avoid per-object calls.

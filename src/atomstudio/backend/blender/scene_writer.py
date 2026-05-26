@@ -6,17 +6,19 @@ from typing import Any
 from atomstudio.backend.blender.atom_batch import AtomMeshInstance, build_atom_mesh_batches
 from atomstudio.backend.blender.bond_batch import BondMeshSegment, build_bond_mesh_batches
 from atomstudio.backend.blender.collections import ensure_collection
-from atomstudio.backend.blender.geometry import collect_bbox_points, tuple3
+from atomstudio.backend.blender.geometry import add_curve_line_between, collect_bbox_points, dashed_line_segments, tuple3
 from atomstudio.backend.blender.material_adapter import BlenderMaterialAdapter, scene_value
 from atomstudio.config import RenderJobConfig
 from atomstudio.scene.materials.registry import MaterialRegistry
-from atomstudio.structure.bond import add_cylinder_between
 from atomstudio.structure.polyhedron import Polyhedron
 
 try:
     import bpy  # type: ignore
+    from mathutils import Matrix, Vector  # type: ignore
 except Exception:  # pragma: no cover
     bpy = None
+    Matrix = None
+    Vector = None
 
 
 class BlenderSceneWriter:
@@ -54,6 +56,7 @@ class BlenderSceneWriter:
         poly_objects = self._write_polyhedra(scene_value(scene, "polyhedra", []))
         cell_objects = self._write_cell_edges(scene_value(scene, "cell_edges", []))
         objects = [*atom_objects, *bond_objects, *poly_objects, *cell_objects]
+        self._apply_model_transform(objects, scene_value(scene, "camera"))
         points = self._collect_bbox_points(objects)
         stats = {
             "atoms": int(atom_count),
@@ -91,6 +94,8 @@ class BlenderSceneWriter:
                     material=material,
                     segments=segments,
                     rings=rings,
+                    index=index,
+                    symbol=str(scene_value(raw_atom, "symbol", "X")),
                 )
             )
             positions_by_index[index] = position
@@ -105,7 +110,10 @@ class BlenderSceneWriter:
 
     def _write_bonds(self, bonds: Sequence[Any]) -> tuple[list[Any], int]:
         segments: list[BondMeshSegment] = []
+        line_objects: list[Any] = []
         for raw_bond in bonds:
+            bond_id = int(scene_value(raw_bond, "id", len(line_objects)))
+            is_hydrogen_bond = str(scene_value(raw_bond, "bond_type", "covalent")) == "hydrogen"
             pipeline = str(scene_value(raw_bond, "pipeline", self.default_material_pipeline))
             style_name = str(scene_value(raw_bond, "style_name", self.default_material_style_name))
             for raw_segment in scene_value(raw_bond, "segments", []) or []:
@@ -117,21 +125,35 @@ class BlenderSceneWriter:
                     pipeline=pipeline,
                     style_name=style_name,
                 )
-                segments.append(
-                    BondMeshSegment(
-                        start=tuple3(scene_value(raw_segment, "start")),
-                        end=tuple3(scene_value(raw_segment, "end")),
-                        radius=float(scene_value(raw_segment, "radius", scene_value(raw_bond, "radius", self.cfg.structure.bond_radius))),
-                        material=material,
-                    )
+                start = tuple3(scene_value(raw_segment, "start"))
+                end = tuple3(scene_value(raw_segment, "end"))
+                radius = float(scene_value(raw_segment, "radius", scene_value(raw_bond, "radius", self.cfg.structure.bond_radius)))
+                if is_hydrogen_bond:
+                    for dash_index, (dash_start, dash_end) in enumerate(dashed_line_segments(start, end)):
+                        obj = add_curve_line_between(
+                            dash_start,
+                            dash_end,
+                            radius,
+                            material,
+                            f"HydrogenBond_{bond_id}_dash_{dash_index}",
+                            collection=self.collections["Bonds"],
+                        )
+                        if obj is not None:
+                            line_objects.append(obj)
+                    continue
+                segments.append(BondMeshSegment(start=start, end=end, radius=radius, material=material))
+        objects = []
+        if segments:
+            objects.extend(
+                build_bond_mesh_batches(
+                    segments,
+                    vertices=int(self.cfg.structure.bond_vertices),
+                    collection=self.collections["Bonds"],
+                    name_prefix="Bonds",
                 )
-        objects = build_bond_mesh_batches(
-            segments,
-            vertices=int(self.cfg.structure.bond_vertices),
-            collection=self.collections["Bonds"],
-            name_prefix="Bonds",
-        )
-        return objects, len(segments)
+            )
+        objects.extend(line_objects)
+        return objects, len(segments) + len(line_objects)
 
     def _write_polyhedra(self, polyhedra: Sequence[Any]) -> list[Any]:
         out: list[Any] = []
@@ -187,13 +209,12 @@ class BlenderSceneWriter:
                 pipeline=str(scene_value(raw_edge, "pipeline", self.default_material_pipeline)),
                 style_name=str(scene_value(raw_edge, "style_name", self.default_material_style_name)),
             )
-            obj = add_cylinder_between(
+            obj = add_curve_line_between(
                 p1,
                 p2,
                 float(scene_value(raw_edge, "radius", self.cfg.structure.cell_style.radius)),
                 material,
                 str(scene_value(raw_edge, "name", f"CellEdge_{index}")),
-                int(scene_value(raw_edge, "vertices", 12)),
                 collection=self.collections["Cell"],
             )
             if obj is not None:
@@ -203,6 +224,43 @@ class BlenderSceneWriter:
     def _collect_bbox_points(self, objects: Sequence[Any]) -> list[Any]:
         return collect_bbox_points(list(objects))
 
+    def _apply_model_transform(self, objects: Sequence[Any], camera: Any) -> None:
+        if not objects or Matrix is None or Vector is None:
+            return
+        values = scene_value(camera, "model_rotation")
+        translation_values = scene_value(camera, "model_translation")
+        matrix = Matrix.Identity(4)
+        has_rotation = isinstance(values, (list, tuple)) and len(values) == 16 and not _matrix_is_identity(values)
+        if has_rotation:
+            try:
+                matrix = Matrix(
+                    (
+                        tuple(float(v) for v in values[0:4]),
+                        tuple(float(v) for v in values[4:8]),
+                        tuple(float(v) for v in values[8:12]),
+                        tuple(float(v) for v in values[12:16]),
+                    )
+                )
+            except Exception:
+                matrix = Matrix.Identity(4)
+                has_rotation = False
+        translation = Vector((0.0, 0.0, 0.0))
+        if isinstance(translation_values, (list, tuple)) and len(translation_values) == 3:
+            try:
+                translation = Vector(tuple(float(v) for v in translation_values))
+            except Exception:
+                translation = Vector((0.0, 0.0, 0.0))
+        has_translation = any(abs(float(v)) > 1.0e-12 for v in translation)
+        if not has_rotation and not has_translation:
+            return
+        center = Vector(tuple3(scene_value(camera, "center")))
+        transform = Matrix.Translation(translation) @ Matrix.Translation(center) @ matrix @ Matrix.Translation(-center)
+        for obj in objects:
+            try:
+                obj.matrix_world = transform @ obj.matrix_world
+            except Exception:
+                continue
+
 
 def _bond_segment_role(side: Any) -> str:
     value = str(side or "uniform").strip().lower()
@@ -211,3 +269,11 @@ def _bond_segment_role(side: Any) -> str:
     if value == "right":
         return "bond_atom_j"
     return "bond_uniform"
+
+
+def _matrix_is_identity(values: Sequence[Any]) -> bool:
+    identity = (1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+    try:
+        return all(abs(float(value) - identity[index]) <= 1.0e-8 for index, value in enumerate(values))
+    except Exception:
+        return True

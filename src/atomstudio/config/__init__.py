@@ -3,6 +3,7 @@ from atomstudio.config.config import (
     AtomStylePresetConfig,
     AtomStyleRuleConfig,
     BatchConfig,
+    BoundaryAtomsConfig,
     BoundaryConfig,
     BondingConfig,
     CameraConfig,
@@ -25,6 +26,8 @@ from atomstudio.config.config import (
     StructureConfig,
     StyleConfig,
     SurfaceOptions,
+    StudioSweepConfig,
+    SunbeamConfig,
 )
 
 __all__ = [
@@ -32,6 +35,7 @@ __all__ = [
     "AtomStylePresetConfig",
     "AtomStyleRuleConfig",
     "BatchConfig",
+    "BoundaryAtomsConfig",
     "BoundaryConfig",
     "BondingConfig",
     "CameraConfig",
@@ -54,4 +58,6 @@ __all__ = [
     "StructureConfig",
     "StyleConfig",
     "SurfaceOptions",
+    "StudioSweepConfig",
+    "SunbeamConfig",
 ]

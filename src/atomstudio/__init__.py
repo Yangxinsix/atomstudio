@@ -1,11 +1,26 @@
 from __future__ import annotations
 
-from atomstudio.render.results import BatchResult, RenderResult
-from atomstudio.structure.api import apply_style, compute_bonds, compute_polyhedra, render_structure_image
-from atomstudio.config import RenderJobConfig
-from atomstudio.structure.structure import Structure
-
 __version__ = "0.1.0"
+
+
+def __getattr__(name: str):
+    if name == "Structure":
+        from atomstudio.structure.structure import Structure
+
+        return Structure
+    if name == "RenderJobConfig":
+        from atomstudio.config import RenderJobConfig
+
+        return RenderJobConfig
+    if name in {"BatchResult", "RenderResult"}:
+        from atomstudio.render import results
+
+        return getattr(results, name)
+    if name in {"apply_style", "compute_bonds", "compute_polyhedra", "render_structure_image"}:
+        from atomstudio.structure import api
+
+        return getattr(api, name)
+    raise AttributeError(name)
 
 
 def load_structure(path: str, frame: int | str = "last") -> Structure:

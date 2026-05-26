@@ -7,6 +7,7 @@ import numpy as np
 from atomstudio.preview.material_adapter import mix_rgba
 from atomstudio.preview.picking import normalize
 from atomstudio.preview.types import PreviewSelection, RenderLineSegment, PreviewRenderScene
+from atomstudio.visual_defaults import HYDROGEN_BOND_LINE_COLOR, HYDROGEN_BOND_LINE_WIDTH
 
 
 def bond_offset_vector(start: np.ndarray, end: np.ndarray) -> np.ndarray:
@@ -157,6 +158,7 @@ def bond_draw_data(
         out.append(
             {
                 "index": bond.index,
+                "bond_type": bond.bond_type,
                 "segments": tuple(
                     {
                         "start": segment.start,
@@ -261,6 +263,8 @@ def build_bond_mesh_payload(
     face_colors: list[np.ndarray] = []
     vertex_offset = 0
     for item in draw_data:
+        if str(item.get("bond_type", "covalent")) == "hydrogen":
+            continue
         for segment in item["segments"]:
             start = np.asarray(segment["start"], dtype=float)
             end = np.asarray(segment["end"], dtype=float)
@@ -277,10 +281,37 @@ def build_bond_mesh_payload(
             faces_list.append(faces)
             face_colors.append(np.tile(np.asarray(segment["color"], dtype=float), (faces.shape[0], 1)))
             vertex_offset += base_vertices.shape[0]
+    if not vertices_list:
+        return {
+            "vertices": np.zeros((0, 3), dtype=float),
+            "faces": np.zeros((0, 3), dtype=np.int32),
+            "face_colors": np.zeros((0, 4), dtype=float),
+        }
     return {
         "vertices": np.concatenate(vertices_list, axis=0),
         "faces": np.concatenate(faces_list, axis=0),
         "face_colors": np.concatenate(face_colors, axis=0),
+    }
+
+
+def build_hydrogen_bond_line_payload(draw_data: tuple[dict[str, Any], ...]) -> dict[str, np.ndarray | float | str]:
+    positions: list[tuple[float, float, float]] = []
+    colors: list[tuple[float, float, float, float]] = []
+    for item in draw_data:
+        if str(item.get("bond_type", "covalent")) != "hydrogen":
+            continue
+        for segment in item["segments"]:
+            positions.append(tuple(float(v) for v in segment["start"]))
+            positions.append(tuple(float(v) for v in segment["end"]))
+            colors.append(HYDROGEN_BOND_LINE_COLOR)
+            colors.append(HYDROGEN_BOND_LINE_COLOR)
+    if not positions:
+        return {"pos": np.zeros((0, 3), dtype=float)}
+    return {
+        "pos": np.asarray(positions, dtype=float),
+        "color": np.asarray(colors, dtype=float),
+        "width": HYDROGEN_BOND_LINE_WIDTH,
+        "connect": "segments",
     }
 
 
@@ -392,6 +423,7 @@ __all__ = [
     "build_atom_mesh_payload",
     "build_bond_instance_payload",
     "build_bond_mesh_payload",
+    "build_hydrogen_bond_line_payload",
     "build_bond_segments",
     "build_cell_visual_payload",
     "build_poly_visual_payload",

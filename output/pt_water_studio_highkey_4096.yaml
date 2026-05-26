@@ -1,0 +1,53 @@
+version: 2
+jobs:
+  - id: pt_water_studio_highkey_4096
+    input:
+      path: /home/xinyang/pt_water.cif
+      frames: last
+    output:
+      path: /home/xinyang/work/atomstudio/output/pt_water_studio_highkey_4096.png
+    style:
+      scene_style: studio_highkey
+      atom_styles:
+        H_custom: {radius: 0.24}
+        O_custom: {radius: 0.42}
+        Pt_custom: {radius: 1.20}
+      atom_style_rules:
+        - selector: {symbol: H}
+          style: H_custom
+        - selector: {symbol: O}
+          style: O_custom
+        - selector: {symbol: Pt}
+          style: Pt_custom
+    structure:
+      draw_cell: false
+      cell_style: {show: false}
+      model_view: "-82.4x,-9.6y,-1.0z"
+      bonding:
+        hbond: {enabled: false}
+    camera:
+      view: top
+      frame_scale: 1.06
+    lighting:
+      ground:
+        enabled: false
+      sweep:
+        enabled: true
+        width_scale: 9.0
+        floor_depth_scale: 7.0
+        wall_height_scale: 8.0
+        radius_scale: 1.6
+        floor_offset_scale: 0.020
+        wall_offset_scale: 0.35
+        segments: 40
+        color: [0.70, 0.725, 0.735, 1.0]
+        roughness: 0.64
+        specular: 0.08
+        coat: 0.04
+        coat_roughness: 0.36
+    render:
+      engine: cycles
+      device: auto
+      samples: 128
+      resolution: [4096, 4096]
+      transparent_bg: false

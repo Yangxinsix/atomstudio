@@ -24,7 +24,7 @@ def group_center(structure: Structure, tag: str) -> np.ndarray:
 def auto_resolve_cross_bonds(structure: Structure, max_iter: int = 40, step: float = 0.50) -> int:
     moved_steps = 0
     for iter_idx in range(max_iter):
-        structure.compute_bonds(BondingConfig(cutoff_scale=1.1, min_distance=0.2))
+        structure.compute_bonds(BondingConfig())
         cross = find_cross_bonds(structure)
         if not cross:
             return moved_steps
@@ -207,7 +207,7 @@ def main() -> None:
 
     structure = Structure.from_ase(combo)
     moved_steps = auto_resolve_cross_bonds(structure, max_iter=40, step=0.50)
-    structure.compute_bonds(BondingConfig(cutoff_scale=1.1, min_distance=0.2))
+    structure.compute_bonds(BondingConfig())
 
     cross = find_cross_bonds(structure)
     if cross:
@@ -259,7 +259,7 @@ def main() -> None:
             "camera": {"fit_padding": 0.09},
             "structure": {
                 "draw_cell": False,
-                "bonding": {"cutoff_scale": 1.1},
+                "bonding": {},
                 "bond_radius": 0.10,
                 "atom_scale": 1.05,
             },

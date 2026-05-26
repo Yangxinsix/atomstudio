@@ -33,15 +33,21 @@ class BaseMaterialSpec:
         }
 
 
+@coerce_color_fields("color", "emission_color", label_prefix="material")
 @dataclass
 class MaterialSpec(BaseMaterialSpec):
     roughness: float = 0.35
     specular: float = 0.30
     metallic: float = 0.0
     ior: float | None = None
+    transmission: float = 0.0
     coat: float = 0.0
     coat_roughness: float = 0.08
     specular_tint: float = 0.0
+    sheen: float = 0.0
+    subsurface: float = 0.0
+    emission_color: tuple[float, float, float, float] | None = None
+    emission_strength: float = 0.0
 
     @classmethod
     def from_dict(
@@ -53,15 +59,23 @@ class MaterialSpec(BaseMaterialSpec):
         color = _to_rgba(src.get("color"), fallback=fallback_color)
         alpha = float(src.get("alpha", color[3]))
         color = (color[0], color[1], color[2], alpha)
+        emission_color = None
+        if src.get("emission_color") is not None:
+            emission_color = _to_rgba(src.get("emission_color"), fallback=fallback_color)
         out = cls(
             color=color,
             roughness=float(src.get("roughness", 0.35)),
             specular=float(src.get("specular", 0.30)),
             metallic=float(src.get("metallic", 0.0)),
             ior=float(src["ior"]) if src.get("ior") is not None else None,
+            transmission=float(src.get("transmission", 0.0)),
             coat=float(src.get("coat", 0.0)),
             coat_roughness=float(src.get("coat_roughness", 0.08)),
             specular_tint=float(src.get("specular_tint", 0.0)),
+            sheen=float(src.get("sheen", 0.0)),
+            subsurface=float(src.get("subsurface", 0.0)),
+            emission_color=emission_color,
+            emission_strength=float(src.get("emission_strength", 0.0)),
             alpha=alpha,
         )
         _set_provided_fields(out, src.keys())
@@ -74,9 +88,14 @@ class MaterialSpec(BaseMaterialSpec):
             "specular": self.specular,
             "metallic": self.metallic,
             "ior": self.ior,
+            "transmission": self.transmission,
             "coat": self.coat,
             "coat_roughness": self.coat_roughness,
             "specular_tint": self.specular_tint,
+            "sheen": self.sheen,
+            "subsurface": self.subsurface,
+            "emission_color": None if self.emission_color is None else list(self.emission_color),
+            "emission_strength": self.emission_strength,
             "alpha": self.alpha,
         }
 
@@ -261,9 +280,14 @@ def as_material_spec(
             "specular",
             "metallic",
             "ior",
+            "transmission",
             "coat",
             "coat_roughness",
             "specular_tint",
+            "sheen",
+            "subsurface",
+            "emission_color",
+            "emission_strength",
         ):
             if name in provided:
                 kwargs[name] = getattr(material, name)
@@ -277,9 +301,14 @@ def as_material_spec(
         specular=float(material.specular),
         metallic=0.0,
         ior=None,
+        transmission=0.0,
         coat=0.0,
         coat_roughness=0.08,
         specular_tint=0.0,
+        sheen=0.0,
+        subsurface=0.0,
+        emission_color=None,
+        emission_strength=0.0,
     )
 
 

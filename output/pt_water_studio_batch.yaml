@@ -1,0 +1,75 @@
+version: 2
+jobs:
+  - id: pt_water_studio_highkey
+    input: {path: /home/xinyang/pt_water.cif, frames: last}
+    output: {path: /home/xinyang/work/atomstudio/output/pt_water_studio_highkey.png}
+    style:
+      scene_style: studio_highkey
+      atom_styles: &pt_water_atom_styles
+        H_custom: {radius: 0.24}
+        O_custom: {radius: 0.42}
+        Pt_custom: {radius: 1.20}
+      atom_style_rules: &pt_water_atom_style_rules
+        - selector: {symbol: H}
+          style: H_custom
+        - selector: {symbol: O}
+          style: O_custom
+        - selector: {symbol: Pt}
+          style: Pt_custom
+    structure: &pt_water_structure
+      draw_cell: false
+      cell_style: {show: false}
+      model_view: "-82.4x,-9.6y,-1.0z"
+    camera: &pt_water_camera
+      view: top
+      frame_scale: 1.06
+    render: &pt_water_render
+      engine: cycles
+      device: auto
+      samples: 96
+      resolution: [1024, 1024]
+      transparent_bg: false
+
+  - id: pt_water_studio_macro
+    input: {path: /home/xinyang/pt_water.cif, frames: last}
+    output: {path: /home/xinyang/work/atomstudio/output/pt_water_studio_macro.png}
+    style:
+      scene_style: studio_macro
+      atom_styles: *pt_water_atom_styles
+      atom_style_rules: *pt_water_atom_style_rules
+    structure: *pt_water_structure
+    camera: *pt_water_camera
+    render: *pt_water_render
+
+  - id: pt_water_studio_crystal_product
+    input: {path: /home/xinyang/pt_water.cif, frames: last}
+    output: {path: /home/xinyang/work/atomstudio/output/pt_water_studio_crystal_product.png}
+    style:
+      scene_style: studio_crystal_product
+      atom_styles: *pt_water_atom_styles
+      atom_style_rules: *pt_water_atom_style_rules
+    structure: *pt_water_structure
+    camera: *pt_water_camera
+    render: *pt_water_render
+
+  - id: pt_water_studio_pearl
+    input: {path: /home/xinyang/pt_water.cif, frames: last}
+    output: {path: /home/xinyang/work/atomstudio/output/pt_water_studio_pearl.png}
+    style:
+      scene_style: studio_pearl
+      atom_styles: *pt_water_atom_styles
+      atom_style_rules: *pt_water_atom_style_rules
+    structure: *pt_water_structure
+    camera: *pt_water_camera
+    render: *pt_water_render
+
+  - id: pt_water_studio_softmetal
+    input: {path: /home/xinyang/pt_water.cif, frames: last}
+    output: {path: /home/xinyang/work/atomstudio/output/pt_water_studio_softmetal.png}
+    style:
+      scene_style: studio_softmetal
+      atom_styles: *pt_water_atom_styles
+      atom_style_rules: *pt_water_atom_style_rules
+    structure: *pt_water_structure
+    camera: *pt_water_camera
+    render: *pt_water_render

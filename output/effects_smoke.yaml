@@ -1,0 +1,19 @@
+version: 2
+jobs:
+  - id: effects_smoke
+    input: {path: tests/data/water.xyz, frames: last}
+    output: {path: /home/xinyang/work/atomstudio/output/effects_smoke.png}
+    style: {scene_style: studio_highkey}
+    render:
+      engine: cycles
+      samples: 16
+      resolution: [384, 384]
+      transparent_bg: false
+      effects:
+        ambient_occlusion: {enabled: true, factor: 0.55, distance: 2.0}
+        bloom: {enabled: true, threshold: 0.92, intensity: 0.08, size: 4}
+        atmosphere: {enabled: true, density: 0.0005, color: [0.82, 0.88, 0.94, 1.0]}
+        volumetric_light: {enabled: true, density: 0.0004, anisotropy: 0.15}
+        vignette: {enabled: true, intensity: 0.08, softness: 0.25}
+        chromatic_aberration: {enabled: true, dispersion: 0.004}
+        film_grain: {enabled: true, strength: 0.01, scale: 65}

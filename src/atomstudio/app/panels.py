@@ -11,11 +11,11 @@ except Exception:  # pragma: no cover
     QtWidgets = None
 
 
-def build_preview_host(parent: Any | None = None):
+def build_preview_host(parent: Any | None = None, *, preview_backend: str = "opengl"):
     if QtWidgets is None:  # pragma: no cover - import-time fallback only
         return None
     try:
-        return PreviewView(parent=parent)
+        return PreviewView(parent=parent, backend=preview_backend)
     except Exception:
         placeholder = QtWidgets.QLabel("Preview canvas unavailable")
         if QtCore is not None and hasattr(QtCore, "Qt"):
@@ -25,7 +25,13 @@ def build_preview_host(parent: Any | None = None):
         return placeholder
 
 
-def apply_preview_scene(canvas: Any, preview_scene: Any, *, frame_index: int | None = None) -> None:
+def apply_preview_scene(
+    canvas: Any,
+    preview_scene: Any,
+    *,
+    frame_index: int | None = None,
+    preserve_camera: bool | None = None,
+) -> None:
     if canvas is None:
         return
     for method_name in (
@@ -38,13 +44,24 @@ def apply_preview_scene(canvas: Any, preview_scene: Any, *, frame_index: int | N
     ):
         method = getattr(canvas, method_name, None)
         if callable(method):
-            if frame_index is None:
+            kwargs: dict[str, Any] = {}
+            if frame_index is not None:
+                kwargs["frame_index"] = frame_index
+            if preserve_camera is not None:
+                kwargs["preserve_camera"] = preserve_camera
+            if not kwargs:
                 method(preview_scene)
             else:
                 try:
-                    method(preview_scene, frame_index=frame_index)
+                    method(preview_scene, **kwargs)
                 except TypeError:
-                    method(preview_scene)
+                    if frame_index is None:
+                        method(preview_scene)
+                    else:
+                        try:
+                            method(preview_scene, frame_index=frame_index)
+                        except TypeError:
+                            method(preview_scene)
             return
     if hasattr(canvas, "scene"):
         canvas.scene = preview_scene

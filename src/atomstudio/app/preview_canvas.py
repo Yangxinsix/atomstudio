@@ -17,12 +17,22 @@ import numpy as np
 
 from atomstudio.app.runtime import configure_preview_runtime
 from atomstudio.app.mouse_tools import PreviewMouseToolController
+from atomstudio.app.preview_input import PreviewInputController
 from atomstudio.config import RenderJobConfig
+from atomstudio.preview.camera import (
+    model_matrix,
+    model_rotation_euler_degrees,
+    pan_camera,
+    rotate_model_about_axis,
+    rotate_model_trackball,
+    set_model_rotation_euler_degrees,
+)
 from atomstudio.preview.lighting import DEFAULT_PREVIEW_LIGHTING, configure_shading_filter
 from atomstudio.preview.mesh_builder import (
     build_atom_instance_payload,
-    build_bond_instance_payload,
+    build_bond_mesh_payload,
     build_cell_visual_payload,
+    build_hydrogen_bond_line_payload,
     build_poly_visual_payload,
 )
 from atomstudio.preview.renderer import (
@@ -102,9 +112,17 @@ except Exception:  # pragma: no cover - fallback for test environments
 try:  # pragma: no cover - optional GUI dependency
     from vispy import scene as vispy_scene  # type: ignore
     from vispy.geometry import create_cylinder, create_sphere  # type: ignore
+    from vispy.visuals.transforms import MatrixTransform  # type: ignore
 except Exception:  # pragma: no cover - fallback for test environments
     create_cylinder = None
     create_sphere = None
+
+    class MatrixTransform:  # type: ignore[no-redef]
+        def __init__(self, matrix: Any | None = None) -> None:
+            self.matrix = matrix
+
+        def update(self) -> None:
+            return None
 
     class _FallbackVisual:
         def __init__(self, *args, **kwargs) -> None:
@@ -185,7 +203,7 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
             self._camera = PreviewCameraState()
 
         def sync_camera(self, camera: PreviewCameraState) -> None:
-            # VESTA-style orientation marker: fixed UI overlay whose axes track view rotation only.
+            # Show the model axes after the same rotation used for the structure.
             self._camera = replace(camera)
             self.update()
 
@@ -242,6 +260,7 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
 
         def _axis_projection(self, origin: Any, axis: tuple[float, float, float]) -> tuple[Any, float, float]:
             right, up, forward = self._camera.basis()
+            axis = self._rotated_axis(axis)
             x = self._dot(axis, right)
             y = self._dot(axis, up)
             depth = self._dot(axis, forward)
@@ -256,7 +275,21 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
             return endpoint, projected_len, depth
 
         def _axis_depth(self, axis: tuple[float, float, float]) -> float:
-            return self._dot(axis, self._camera.forward)
+            return self._dot(self._rotated_axis(axis), self._camera.forward)
+
+        def _rotated_axis(self, axis: tuple[float, float, float]) -> tuple[float, float, float]:
+            values = getattr(self._camera, "model_rotation", None)
+            if values is None:
+                return axis
+            try:
+                matrix = np.asarray(values, dtype=float).reshape((4, 4))
+            except (TypeError, ValueError):
+                return axis
+            vector = matrix[:3, :3] @ np.asarray(axis, dtype=float)
+            norm = float(np.linalg.norm(vector))
+            if norm <= 1.0e-12:
+                return axis
+            return tuple(float(value) for value in vector / norm)
 
         @staticmethod
         def _dot(left: tuple[float, float, float], right: tuple[float, float, float]) -> float:
@@ -271,6 +304,7 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
             self.model.selection_changed.connect(self._on_selection_changed)
             self.selection_changed = self.model.selection_changed
             self.interaction_message_changed = CallbackSignal()
+            self.camera_changed = CallbackSignal()
             self.renderer_mode = "instanced"
             self._mesh_enabled = bool(create_sphere is not None and create_cylinder is not None)
             self._instancing_status = self._detect_instancing_status()
@@ -284,7 +318,7 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
             if not hasattr(getattr(vispy_scene, "visuals", None), "InstancedMesh"):
                 raise RuntimeError("AtomStudio preview requires vispy.scene.visuals.InstancedMesh")
 
-            self._canvas = vispy_scene.SceneCanvas(keys="interactive", bgcolor=self.settings.background, show=False, parent=self)
+            self._canvas = vispy_scene.SceneCanvas(keys=None, bgcolor=self.settings.background, show=False, parent=self)
             self._view = self._canvas.central_widget.add_view()
             self._view.camera = vispy_scene.cameras.TurntableCamera(
                 azimuth=self.model.camera.azimuth,
@@ -300,10 +334,23 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
             visual_parent = getattr(self._view, "scene", None)
             self._atom_instance_visual = self._create_instanced_visual(self._sphere_mesh, visual_parent)
             self._bond_instance_visual = self._create_instanced_visual(self._cylinder_mesh, visual_parent)
+            self._bond_mesh_visual = vispy_scene.visuals.Mesh(parent=visual_parent, shading="smooth")
+            self._configure_opaque_mesh_visual(self._bond_mesh_visual)
+            self._hbond_line_visual = vispy_scene.visuals.Line(parent=visual_parent)
             self._selection_shell_visual = vispy_scene.visuals.Mesh(parent=visual_parent, shading="smooth")
             self._cell_visual = vispy_scene.visuals.Line(parent=visual_parent)
             self._poly_visual = vispy_scene.visuals.Mesh(parent=visual_parent, shading="smooth")
             self._poly_edge_visual = vispy_scene.visuals.Line(parent=visual_parent)
+            self._model_transform = MatrixTransform()
+            self._model_transform_targets = (
+                self._atom_instance_visual,
+                self._bond_mesh_visual,
+                self._hbond_line_visual,
+                self._selection_shell_visual,
+                self._cell_visual,
+                self._poly_visual,
+                self._poly_edge_visual,
+            )
             self._configure_selection_visuals()
             self._axis_overlay = AxisOverlayWidget(self, background=self.settings.background)
             self._axis_overlay_visible = True
@@ -329,6 +376,8 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
             self._install_layout()
             self._mouse_tools = PreviewMouseToolController(self, getattr(self._canvas, "native", None), parent=self)
             self._mouse_tools.install()
+            self._input_controller = PreviewInputController(self, parent=self)
+            self._input_controller.install_on(self, getattr(self._canvas, "native", None))
             self._bind_events()
             self._sync_camera()
 
@@ -353,6 +402,17 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
                 pass
             visual.visible = False
             return visual
+
+        @staticmethod
+        def _configure_opaque_mesh_visual(visual: Any) -> None:
+            try:
+                visual.set_gl_state("opaque", depth_test=True, cull_face=False)
+            except Exception:
+                pass
+            try:
+                visual.visible = False
+            except Exception:
+                pass
 
         @staticmethod
         def _detect_instancing_status() -> dict[str, Any]:
@@ -392,6 +452,10 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
             layout.setContentsMargins(0, 0, 0, 0)
             layout.setSpacing(0)
             layout.addWidget(self._canvas.native, 0, 0)
+            if QtCore is not None:
+                for widget in (self, getattr(self._canvas, "native", None)):
+                    if hasattr(widget, "setFocusPolicy"):
+                        widget.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
             align = 0
             if QtCore is not None and hasattr(QtCore, "Qt"):
                 align = QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignBottom
@@ -408,6 +472,10 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
                 events.mouse_move.connect(self._mouse_tools.handle_move)
             if events is not None and getattr(events, "mouse_release", None) is not None:
                 events.mouse_release.connect(self._mouse_tools.handle_release)
+            if events is not None and getattr(events, "mouse_wheel", None) is not None:
+                events.mouse_wheel.connect(self._mouse_tools.handle_wheel)
+            if events is not None and getattr(events, "key_press", None) is not None:
+                events.key_press.connect(self._handle_key_press)
             if events is not None and getattr(events, "draw", None) is not None:
                 events.draw.connect(self._capture_graphics_info_once)
             for event_name in ("mouse_move", "mouse_release", "mouse_wheel"):
@@ -417,6 +485,17 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
             camera_events = getattr(getattr(self._view, "camera", None), "events", None)
             if camera_events is not None and getattr(camera_events, "transform_change", None) is not None:
                 camera_events.transform_change.connect(self._on_camera_transform)
+
+        def event(self, event: Any) -> bool:
+            controller = getattr(self, "_input_controller", None)
+            if controller is not None and controller.consume_event(event):
+                return True
+            return super().event(event)
+
+        def _handle_key_press(self, event: Any) -> None:
+            controller = getattr(self, "_input_controller", None)
+            if controller is not None and controller.consume_vispy_key_event(event):
+                return
 
         def _schedule_camera_sync(self, _event: Any = None) -> None:
             if self._camera_sync_pending:
@@ -448,6 +527,8 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
                 tuple(round(float(v), 6) for v in camera.right),
                 tuple(round(float(v), 6) for v in camera.up),
                 tuple(round(float(v), 6) for v in camera.forward),
+                tuple(round(float(v), 6) for v in getattr(camera, "model_translation", (0.0, 0.0, 0.0))),
+                tuple(round(float(v), 6) for v in camera.model_rotation),
             )
 
         def _pull_camera_state_from_view(self) -> None:
@@ -479,8 +560,28 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
             camera = self.model.camera
             self._set_view_camera(camera.center, camera.scale_factor, camera.azimuth, camera.elevation, camera.roll)
             self._pull_camera_state_from_view()
+            self._apply_model_transform()
             self._apply_preview_lighting()
             self._sync_axis_overlay()
+
+        def _apply_model_transform(self) -> None:
+            matrix = np.asarray(model_matrix(self.model.camera), dtype=np.float32).T
+            try:
+                self._model_transform.matrix = matrix
+            except Exception:
+                self._model_transform = MatrixTransform(matrix)
+            for visual in self._model_transform_targets:
+                if visual is None:
+                    continue
+                try:
+                    visual.transform = self._model_transform
+                    update = getattr(visual, "update", None)
+                    if callable(update):
+                        update()
+                except Exception:
+                    continue
+            if hasattr(self, "_axis_overlay"):
+                self._sync_axis_overlay()
 
         def _set_view_camera(
             self,
@@ -522,7 +623,7 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
 
         def _apply_preview_lighting(self) -> None:
             configure_shading_filter(self._atom_instance_visual, self.model.camera, self._lighting)
-            configure_shading_filter(self._bond_instance_visual, self.model.camera, self._lighting)
+            configure_shading_filter(self._bond_mesh_visual, self.model.camera, self._lighting)
             configure_shading_filter(self._poly_visual, self.model.camera, self._lighting)
             configure_shading_filter(self._selection_shell_visual, self.model.camera, self._lighting)
 
@@ -556,8 +657,8 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
             candidates: list[tuple[float, float, int]] = []
             for bond in self.model.scene.bonds:
                 for segment in bond.segments:
-                    start = self._map_scene_point(transform, segment.start)
-                    end = self._map_scene_point(transform, segment.end)
+                    start = self._map_model_point(transform, segment.start)
+                    end = self._map_model_point(transform, segment.end)
                     if start is None or end is None:
                         continue
                     distance, weight = segment_distance_2d(point, (start[0], start[1]), (end[0], end[1]))
@@ -687,8 +788,8 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
             selected: set[int] = set()
             for bond in self.model.scene.bonds:
                 for segment in bond.segments:
-                    a = self._map_scene_point(transform, segment.start)
-                    b = self._map_scene_point(transform, segment.end)
+                    a = self._map_model_point(transform, segment.start)
+                    b = self._map_model_point(transform, segment.end)
                     if a is None or b is None:
                         continue
                     half_width = max(6.0, float(segment.width_px) * 0.5)
@@ -706,7 +807,7 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
                 return self.model.hit_test_cache(self._viewport_size())
             hits: list[AtomHit] = []
             for atom in self.model.scene.atoms:
-                projected = self._map_scene_point(transform, atom.position)
+                projected = self._map_model_point(transform, atom.position)
                 if projected is None:
                     continue
                 x, y, _mapped_depth = projected
@@ -724,7 +825,7 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
 
         def _view_depth(self, point: tuple[float, float, float]) -> float:
             camera = self.model.camera
-            rel = np.asarray(point, dtype=float) - np.asarray(camera.center, dtype=float)
+            rel = self._model_transformed_point(point) - np.asarray(camera.center, dtype=float)
             return float(np.dot(rel, np.asarray(camera.forward, dtype=float)))
 
         def _scene_to_canvas_transform(self) -> Any | None:
@@ -750,20 +851,29 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
                 return None
             return float(mapped[0]) / w, float(mapped[1]) / w, float(mapped[2]) / w
 
+        def _map_model_point(self, transform: Any, point: tuple[float, float, float]) -> tuple[float, float, float] | None:
+            transformed = self._model_transformed_point(point)
+            return self._map_scene_point(transform, tuple(float(value) for value in transformed))
+
+        def _model_transformed_point(self, point: tuple[float, float, float]) -> np.ndarray:
+            homogeneous = np.ones((4,), dtype=float)
+            homogeneous[:3] = np.asarray(point, dtype=float)
+            return (np.asarray(model_matrix(self.model.camera), dtype=float) @ homogeneous)[:3]
+
         def _projected_atom_radius(
             self,
             transform: Any,
             position: tuple[float, float, float],
             radius: float,
         ) -> float:
-            center = self._map_scene_point(transform, position)
+            center = self._map_model_point(transform, position)
             if center is None:
                 return float(self.settings.picking_radius_px)
             px = []
             base = np.asarray(position, dtype=float)
             radius_value = max(1e-6, float(radius))
             for axis in np.eye(3, dtype=float):
-                mapped = self._map_scene_point(transform, tuple(float(v) for v in base + axis * radius_value))
+                mapped = self._map_model_point(transform, tuple(float(v) for v in base + axis * radius_value))
                 if mapped is None:
                     continue
                 dx = float(mapped[0]) - float(center[0])
@@ -873,6 +983,7 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
             self._sync_camera()
             self._refresh_visuals()
             self._canvas.update()
+            self._emit_camera_changed()
             return scene
 
         def set_preview_scene(
@@ -880,11 +991,13 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
             preview_scene: PreviewRenderScene | BufferPreviewScene,
             *,
             frame_index: int | None = None,
+            preserve_camera: bool | None = None,
         ) -> PreviewRenderScene:
-            scene = self.model.set_preview_scene(preview_scene)
+            scene = self.model.set_preview_scene(preview_scene, preserve_camera=preserve_camera)
             self._sync_camera()
             self._refresh_visuals()
             self._canvas.update()
+            self._emit_camera_changed()
             return scene
 
         def update_preview_scene(
@@ -892,60 +1005,66 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
             preview_scene: PreviewRenderScene | BufferPreviewScene,
             *,
             frame_index: int | None = None,
+            preserve_camera: bool | None = None,
         ) -> PreviewRenderScene:
-            return self.set_preview_scene(preview_scene, frame_index=frame_index)
+            return self.set_preview_scene(preview_scene, frame_index=frame_index, preserve_camera=preserve_camera)
 
         def fit_to_structure(self, padding: float | None = None) -> PreviewCameraState:
             camera = self.model.fit_to_structure(padding)
             self._sync_camera()
             self._canvas.update()
+            self._emit_camera_changed()
             return camera
 
         def set_view_preset(self, view: str) -> PreviewCameraState:
             camera = self.model.set_view_preset(view)
             self._sync_camera()
             self._canvas.update()
+            self._emit_camera_changed()
             return camera
 
         def set_axis_view(self, axis: str) -> PreviewCameraState:
             axis_key = str(axis or "").strip().lower()
-            preset = {"a": "side", "x": "side", "b": "front", "y": "front", "c": "top", "z": "top"}.get(axis_key, "orbit")
-            return self.set_view_preset(preset)
+            self.model.set_view_preset("top")
+            if axis_key in {"a", "x"}:
+                set_model_rotation_euler_degrees(self.model.camera, (0.0, -90.0, -90.0))
+            elif axis_key in {"b", "y"}:
+                set_model_rotation_euler_degrees(self.model.camera, (90.0, 0.0, 90.0))
+            else:
+                set_model_rotation_euler_degrees(self.model.camera, (0.0, 0.0, 0.0))
+            self._sync_camera()
+            self._canvas.update()
+            self._emit_camera_changed()
+            return self.model.camera
 
         def rotate_view(self, axis: str, direction: int, degrees: float = 15.0) -> PreviewCameraState:
             self._pull_camera_state_from_view()
             step = float(degrees) * (1.0 if int(direction) >= 0 else -1.0)
             axis_key = str(axis or "").strip().lower()
             if axis_key in {"c", "z"}:
-                self.model.camera.azimuth += step
+                rotate_model_about_axis(self.model.camera, (0.0, 0.0, 1.0), step)
             elif axis_key in {"a", "x"}:
-                self.model.camera.elevation += step
+                rotate_model_about_axis(self.model.camera, (1.0, 0.0, 0.0), step)
             elif axis_key in {"b", "y"}:
-                self.model.camera.roll += step
-            self.model.camera.right, self.model.camera.up, self.model.camera.forward = rotation_basis(
-                self.model.camera.azimuth,
-                self.model.camera.elevation,
-                self.model.camera.roll,
-            )
-            self._sync_camera()
+                rotate_model_about_axis(self.model.camera, (0.0, 1.0, 0.0), step)
+            self._apply_model_transform()
             self._canvas.update()
+            self._emit_camera_changed()
+            return self.model.camera
+
+        def rotate_model_drag(self, start: tuple[float, float], end: tuple[float, float]) -> PreviewCameraState:
+            rotate_model_trackball(self.model.camera, start, end, self._viewport_size())
+            self._apply_model_transform()
+            self._canvas.update()
+            self._emit_camera_changed()
             return self.model.camera
 
         def pan_view(self, dx: float = 0.0, dy: float = 0.0) -> PreviewCameraState:
             self._pull_camera_state_from_view()
-            camera = self.model.camera
-            width, height = self._viewport_size()
-            step_x = max(1e-6, float(camera.scale_factor)) / max(1.0, float(width) * 0.5)
-            step_y = max(1e-6, float(camera.scale_factor)) / max(1.0, float(height) * 0.5)
-            right = tuple(float(v) for v in camera.right)
-            up = tuple(float(v) for v in camera.up)
-            center = tuple(
-                float(camera.center[i]) - float(dx) * step_x * right[i] - float(dy) * step_y * up[i]
-                for i in range(3)
-            )
-            self.model.camera.center = center
-            self._sync_camera()
+            pan_camera(self.model.camera, dx, dy, self._viewport_size())
+            self._apply_model_transform()
             self._canvas.update()
+            self._emit_camera_changed()
             return self.model.camera
 
         def zoom_view(self, factor: float) -> PreviewCameraState:
@@ -954,11 +1073,25 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
             self.model.camera.scale_factor = max(1e-6, float(self.model.camera.scale_factor) / factor)
             self._sync_camera()
             self._canvas.update()
+            self._emit_camera_changed()
             return self.model.camera
 
         def current_camera_state(self) -> PreviewCameraState:
             self._pull_camera_state_from_view()
             return self.model.camera
+
+        def model_rotation_angles(self) -> tuple[float, float, float]:
+            return model_rotation_euler_degrees(self.model.camera)
+
+        def set_model_rotation_angles(self, x: float, y: float, z: float) -> PreviewCameraState:
+            set_model_rotation_euler_degrees(self.model.camera, (float(x), float(y), float(z)))
+            self._apply_model_transform()
+            self._canvas.update()
+            self._emit_camera_changed()
+            return self.model.camera
+
+        def _emit_camera_changed(self) -> None:
+            self.camera_changed.emit(self.current_camera_state())
 
         def select_preview_object(self, selection: PreviewSelection | None) -> PreviewSelection | None:
             selection = self.model.select_preview_object(selection)
@@ -985,6 +1118,12 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
             self.model.clear_selection()
             self._refresh_visuals()
             self._canvas.update()
+
+        def cancel_interaction(self) -> None:
+            mouse_tools = getattr(self, "_mouse_tools", None)
+            if mouse_tools is not None:
+                mouse_tools.cancel_interaction()
+            self.clear_selection()
 
         def delete_selected_objects(self) -> dict[str, int]:
             deleted = self.model.delete_selected_objects()
@@ -1120,6 +1259,7 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
 
         def _refresh_visuals(self) -> None:
             self._update_instanced_visuals()
+            self._update_bond_mesh_visual()
             self.renderer_mode = "instanced"
             self.model.renderer_mode = self.renderer_mode
             if self.model.scene is not None and self.model.scene.report is not None:
@@ -1127,7 +1267,6 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
             if self.model.shared_scene is not None and getattr(self.model.shared_scene, "report", None) is not None:
                 self.model.shared_scene.report["preview_renderer"] = self.renderer_mode
             self._atom_instance_visual.visible = True
-            self._bond_instance_visual.visible = True
             self._update_selection_visuals()
             self._cell_visual.set_data(**build_cell_visual_payload(self.model.scene))
             poly_payload = build_poly_visual_payload(self.model.scene)
@@ -1140,14 +1279,23 @@ if QtWidgets is not None:  # pragma: no cover - exercised only when GUI deps are
 
         def _update_instanced_visuals(self) -> bool:
             atom_payload = build_atom_instance_payload(self.model.atom_draw_data())
-            bond_payload = build_bond_instance_payload(
-                self.model.bond_draw_data(),
-                bond_scale=self.settings.bond_scale,
-            )
             self._set_instance_payload(self._atom_instance_visual, atom_payload)
-            self._set_instance_payload(self._bond_instance_visual, bond_payload)
+            self._bond_instance_visual.visible = False
             self._apply_preview_lighting()
             return True
+
+        def _update_bond_mesh_visual(self) -> None:
+            payload = build_bond_mesh_payload(
+                self.model.bond_draw_data(),
+                self._cylinder_mesh,
+                bond_scale=self.settings.bond_scale,
+            )
+            visible = bool(len(payload.get("vertices", ())))
+            self._bond_mesh_visual.visible = visible
+            if visible:
+                self._bond_mesh_visual.set_data(**payload)
+            hbond_payload = build_hydrogen_bond_line_payload(self.model.bond_draw_data())
+            self._hbond_line_visual.set_data(**hbond_payload)
 
         @staticmethod
         def _set_instance_payload(visual: Any, payload: dict[str, np.ndarray]) -> None:

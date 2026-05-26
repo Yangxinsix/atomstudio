@@ -14,7 +14,7 @@ class Cell:
     vectors: list[list[float]] = field(default_factory=lambda: [[0.0, 0.0, 0.0] for _ in range(3)])
     pbc: tuple[bool, bool, bool] = (False, False, False)
     show: bool = False
-    radius: float = 0.04
+    radius: float = 0.01
     style: str | None = None
     material: MaterialLike | None = None
     color: tuple[float, float, float, float] | None = None

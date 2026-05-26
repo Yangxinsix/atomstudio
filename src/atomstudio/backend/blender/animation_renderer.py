@@ -4,7 +4,14 @@ from pathlib import Path
 from typing import Any
 
 from atomstudio.backend.blender.collections import ensure_collection
-from atomstudio.backend.blender.geometry import collect_bbox_points, set_cylinder_between, tuple3
+from atomstudio.backend.blender.geometry import (
+    add_curve_line_between,
+    collect_bbox_points,
+    dashed_line_segments,
+    set_curve_line_between,
+    set_cylinder_between,
+    tuple3,
+)
 from atomstudio.backend.blender.material_adapter import BlenderMaterialAdapter, scene_value
 from atomstudio.backend.blender.scene_setup import apply_camera_lights_effects, apply_render_environment, write_scene_metadata
 from atomstudio.config import RenderJobConfig
@@ -144,6 +151,7 @@ class BlenderAnimationRenderer:
     def _create_bonds(self, bonds: list[Any]) -> None:
         for raw_bond in bonds:
             bond_id = int(scene_value(raw_bond, "id", 0))
+            is_hydrogen_bond = str(scene_value(raw_bond, "bond_type", "covalent")) == "hydrogen"
             objects: list[Any] = []
             for segment_index, segment in enumerate(scene_value(raw_bond, "segments", []) or []):
                 material = self.materials.resolve(
@@ -153,10 +161,27 @@ class BlenderAnimationRenderer:
                     pipeline=self.style_bundle.material_style.pipeline,
                     style_name=self.style_bundle.material_style_name,
                 )
+                start = tuple3(scene_value(segment, "start"))
+                end = tuple3(scene_value(segment, "end"))
+                radius = float(scene_value(segment, "radius", scene_value(raw_bond, "radius", self.cfg.structure.bond_radius)))
+                if is_hydrogen_bond:
+                    for dash_index, (dash_start, dash_end) in enumerate(dashed_line_segments(start, end)):
+                        obj = add_curve_line_between(
+                            dash_start,
+                            dash_end,
+                            radius,
+                            material,
+                            f"HydrogenBond_{bond_id}_segment_{segment_index}_dash_{dash_index}",
+                            collection=self.collections["Bonds"],
+                        )
+                        if obj is not None:
+                            objects.append(obj)
+                            self.objects.append(obj)
+                    continue
                 obj = add_cylinder_between(
-                    tuple3(scene_value(segment, "start")),
-                    tuple3(scene_value(segment, "end")),
-                    float(scene_value(segment, "radius", scene_value(raw_bond, "radius", self.cfg.structure.bond_radius))),
+                    start,
+                    end,
+                    radius,
                     material,
                     f"Bond_{bond_id}_segment_{segment_index}",
                     int(self.cfg.structure.bond_vertices),
@@ -177,13 +202,12 @@ class BlenderAnimationRenderer:
                 pipeline=self.style_bundle.material_style.pipeline,
                 style_name=self.style_bundle.material_style_name,
             )
-            obj = add_cylinder_between(
+            obj = add_curve_line_between(
                 tuple3(scene_value(raw_edge, "start")),
                 tuple3(scene_value(raw_edge, "end")),
                 float(scene_value(raw_edge, "radius", self.cfg.structure.cell_style.radius)),
                 material,
                 f"CellEdge_{edge_index}",
-                12,
                 collection=self.collections["Cell"],
             )
             if obj is not None:
@@ -207,6 +231,21 @@ class BlenderAnimationRenderer:
         for bond_id, bond in bonds.items():
             segments = list(scene_value(bond, "segments", []) or [])
             objects = self.bond_objects[bond_id]
+            is_hydrogen_bond = str(scene_value(bond, "bond_type", "covalent")) == "hydrogen"
+            if is_hydrogen_bond:
+                dashed_segments = [
+                    (dash_start, dash_end, float(scene_value(segment, "radius", scene_value(bond, "radius", self.cfg.structure.bond_radius))))
+                    for segment in segments
+                    for dash_start, dash_end in dashed_line_segments(
+                        tuple3(scene_value(segment, "start")),
+                        tuple3(scene_value(segment, "end")),
+                    )
+                ]
+                if len(dashed_segments) != len(objects):
+                    raise ValueError(f"Animation bond {bond_id} segment count changed; BlenderAnimationRenderer requires stable bond segments.")
+                for obj, (dash_start, dash_end, radius) in zip(objects, dashed_segments):
+                    set_curve_line_between(obj, dash_start, dash_end, radius)
+                continue
             if len(segments) != len(objects):
                 raise ValueError(f"Animation bond {bond_id} segment count changed; BlenderAnimationRenderer requires stable bond segments.")
             for obj, segment in zip(objects, segments):
@@ -221,7 +260,7 @@ class BlenderAnimationRenderer:
         if set(edges) != set(self.cell_objects):
             raise ValueError("Animation cell topology changed; BlenderAnimationRenderer requires stable cell edge indices.")
         for edge_index, edge in edges.items():
-            set_cylinder_between(
+            set_curve_line_between(
                 self.cell_objects[edge_index],
                 tuple3(scene_value(edge, "start")),
                 tuple3(scene_value(edge, "end")),

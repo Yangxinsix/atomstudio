@@ -173,10 +173,15 @@ class SceneCamera:
     distance: float | None = None
     rotation: str | None = None
     rotation_euler: Vec3 | None = None
+    model_rotation: tuple[float, ...] | None = None
+    model_translation: Vec3 | None = None
     view: str = "top"
     frame_scale: float = 1.0
     ase_view_rotations: str | None = None
     ase_view_axes_matrix: tuple[tuple[float, float, float], ...] | None = None
+    dof_enabled: bool = False
+    focus_distance: float | None = None
+    aperture_fstop: float = 5.6
 
     def __post_init__(self) -> None:
         self.projection = str(self.projection).upper()
@@ -197,10 +202,15 @@ class SceneCamera:
         self.distance = None if self.distance is None else float(self.distance)
         self.rotation = None if self.rotation is None else str(self.rotation)
         self.rotation_euler = None if self.rotation_euler is None else _vec3(self.rotation_euler)
+        self.model_rotation = None if self.model_rotation is None else tuple(float(v) for v in self.model_rotation)
+        self.model_translation = None if self.model_translation is None else _vec3(self.model_translation)
         self.view = str(self.view)
         self.frame_scale = float(self.frame_scale)
         if self.ase_view_axes_matrix is not None:
             self.ase_view_axes_matrix = tuple(_vec3(row) for row in self.ase_view_axes_matrix)
+        self.dof_enabled = bool(self.dof_enabled)
+        self.focus_distance = None if self.focus_distance is None else float(self.focus_distance)
+        self.aperture_fstop = float(self.aperture_fstop)
 
 
 @dataclass(slots=True)
@@ -209,6 +219,8 @@ class SceneLight:
     location: Vec3
     energy: float
     size: float
+    size_y: float | None = None
+    shape: str | None = None
     color: Vec4 | None = None
     direction: Vec3 | None = None
     lock_to_camera: bool = False
@@ -219,6 +231,8 @@ class SceneLight:
         self.location = _vec3(self.location)
         self.energy = float(self.energy)
         self.size = float(self.size)
+        self.size_y = None if self.size_y is None else float(self.size_y)
+        self.shape = None if self.shape is None else str(self.shape).upper()
         self.color = None if self.color is None else _vec4(self.color)
         self.direction = None if self.direction is None else _vec3(self.direction)
         self.lock_to_camera = bool(self.lock_to_camera)

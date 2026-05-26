@@ -54,6 +54,12 @@ def load_trajectory(path: str, frame_selector: str = "all") -> list[Structure]:
     return _load_trajectory(path, frame_selector=frame_selector)
 
 
+def selected_frame_indices(path: str, frame_selector: str = "all") -> list[int]:
+    from atomstudio.io.ase_loader import count_trajectory_frames, parse_frame_selector
+
+    return parse_frame_selector(frame_selector, count_trajectory_frames(path))
+
+
 def render_structure(
     structure: Structure,
     render_config: RenderJobConfig,
@@ -115,16 +121,18 @@ def build_default_render_config(structure: Structure, output_path: str | None = 
 
 def load_structure_bundle(request: LoadStructureRequest) -> LoadedFrameBundle:
     path = str(Path(normalize_host_path(request.input_path)).expanduser().resolve())
-    frames = load_trajectory(path, frame_selector=str(request.frame_selector or "all"))
-    if not frames:
+    selector = str(request.frame_selector or "all")
+    frame_indices = selected_frame_indices(path, selector)
+    if not frame_indices:
         raise ValueError(f"No frames were loaded from {path}")
     selected_index = 0 if request.selected_index is None else int(request.selected_index)
-    bundle = LoadedFrameBundle(
+    bundle = LoadedFrameBundle.lazy(
         source_path=path,
-        frame_selector=str(request.frame_selector or "all"),
-        frames=frames,
+        frame_selector=selector,
+        frame_indices=frame_indices,
         selected_index=selected_index,
     )
+    bundle.current()
     return bundle
 
 
@@ -217,6 +225,19 @@ if QtCore is not None:  # pragma: no cover - exercised only with Qt installed
             self.finished.emit(result)
 
 
+    class _TaskCallbacks(QtCore.QObject):
+        finished = QtCore.Signal(object)
+        failed = QtCore.Signal(object)
+
+        @QtCore.Slot(object)
+        def deliver_finished(self, result: object) -> None:
+            self.finished.emit(result)
+
+        @QtCore.Slot(object)
+        def deliver_failed(self, error: object) -> None:
+            self.failed.emit(error)
+
+
 def start_background_task(
     task: Callable[[], Any],
     *,
@@ -240,17 +261,21 @@ def start_background_task(
 
     thread = QtCore.QThread(parent)
     runner = _TaskRunner(task, label=label)
+    callbacks = _TaskCallbacks(parent)
     runner.moveToThread(thread)
 
     thread.started.connect(runner.run)
     if on_result is not None:
-        runner.finished.connect(on_result)
+        callbacks.finished.connect(on_result)
     if on_error is not None:
-        runner.failed.connect(on_error)
+        callbacks.failed.connect(on_error)
+    runner.finished.connect(callbacks.deliver_finished)
+    runner.failed.connect(callbacks.deliver_failed)
     runner.finished.connect(thread.quit)
     runner.failed.connect(thread.quit)
     thread.finished.connect(runner.deleteLater)
     thread.finished.connect(thread.deleteLater)
     thread._runner = runner  # type: ignore[attr-defined]
+    thread._callbacks = callbacks  # type: ignore[attr-defined]
     thread.start()
     return thread
